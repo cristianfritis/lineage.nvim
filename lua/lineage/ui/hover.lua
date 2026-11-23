@@ -193,6 +193,60 @@ local function bind_hover_keymaps(bufnr, hover_id)
     render_card(hover_id)
   end, map_opts)
 
+  vim.keymap.set("n", "gs", function()
+    if hover_id ~= active.hover_id then
+      return
+    end
+    local origin_win = active.origin_win
+    local origin_pos = active.origin_pos
+    close_hover(true)
+    local bufnr = origin_win and vim.api.nvim_win_is_valid(origin_win)
+      and vim.api.nvim_win_get_buf(origin_win) or vim.api.nvim_get_current_buf()
+    require("lineage.ui.focus").focus({ bufnr = bufnr, position = origin_pos })
+  end, map_opts)
+
+  vim.keymap.set("n", "gp", function()
+    if hover_id ~= active.hover_id then
+      return
+    end
+    local origin_win = active.origin_win
+    local origin_pos = active.origin_pos
+    close_hover(true)
+    local bufnr = origin_win and vim.api.nvim_win_is_valid(origin_win)
+      and vim.api.nvim_win_get_buf(origin_win) or vim.api.nvim_get_current_buf()
+    require("lineage.ui.focus").pin({ bufnr = bufnr, position = origin_pos })
+  end, map_opts)
+
+  vim.keymap.set("n", "gt", function()
+    if hover_id ~= active.hover_id then
+      return
+    end
+    local origin_win = active.origin_win
+    local origin_pos = active.origin_pos
+    close_hover(true)
+    require("lineage.ui.tree").open("to", { origin_win = origin_win, origin_pos = origin_pos })
+  end, map_opts)
+
+  vim.keymap.set("n", "gf", function()
+    if hover_id ~= active.hover_id then
+      return
+    end
+    local origin_win = active.origin_win
+    local origin_pos = active.origin_pos
+    close_hover(true)
+    require("lineage.ui.tree").open("from", { origin_win = origin_win, origin_pos = origin_pos })
+  end, map_opts)
+
+  vim.keymap.set("n", "gn", function()
+    if hover_id ~= active.hover_id then
+      return
+    end
+    local origin_win = active.origin_win
+    local origin_pos = active.origin_pos
+    close_hover(true)
+    require("lineage.ui.tree").open("both", { origin_win = origin_win, origin_pos = origin_pos })
+  end, map_opts)
+
   local closes = km.close or { "q", "<Esc>" }
   if type(closes) == "string" then
     closes = { closes }

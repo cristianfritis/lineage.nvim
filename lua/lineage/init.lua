@@ -30,6 +30,45 @@ function M.back()
   require("lineage.ui.jump_stack").pop()
 end
 
+function M.focus()
+  if not initialized then
+    M.setup()
+  end
+  require("lineage.ui.focus").focus()
+end
+
+function M.pin()
+  if not initialized then
+    M.setup()
+  end
+  require("lineage.ui.focus").pin()
+end
+
+function M.clear()
+  require("lineage.ui.focus").clear()
+end
+
+function M.to()
+  if not initialized then
+    M.setup()
+  end
+  require("lineage.ui.tree").open("to")
+end
+
+function M.from()
+  if not initialized then
+    M.setup()
+  end
+  require("lineage.ui.tree").open("from")
+end
+
+function M.both()
+  if not initialized then
+    M.setup()
+  end
+  require("lineage.ui.tree").open("both")
+end
+
 function M.status()
   if not initialized then
     M.setup()

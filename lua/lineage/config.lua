@@ -21,6 +21,9 @@ M.defaults = {
   lsp = {
     timeout_ms = 150,
   },
+  tree = {
+    height = 14,
+  },
   exclude_tests = false,
 }
 
