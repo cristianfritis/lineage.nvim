@@ -9,9 +9,9 @@ use crossbeam_channel::{bounded, unbounded, Sender};
 
 use crate::cache::parse_worker_cap;
 use crate::protocol::schema::{
-    CancelRequestParams, CloseBufferParams, DebugDumpParams, EngineCapabilities, InitializeParams,
-    InitializeResult, LspResolveBatchParams, LspResolveBatchResult, RpcError, RpcId,
-    RpcNotification, RpcRequest, RpcResponse, SliceParams, StatusResult, SyncBufferParams,
+    CancelRequestParams, CloseBufferParams, DebugDumpParams, EngineCapabilities, ExpandParams,
+    InitializeParams, InitializeResult, LspResolveBatchParams, LspResolveBatchResult, RpcError,
+    RpcId, RpcNotification, RpcRequest, RpcResponse, SliceParams, StatusResult, SyncBufferParams,
     PROTOCOL_VERSION, SCHEMA_VERSION,
 };
 use crate::resolver::ewma::EwmaTracker;
@@ -334,6 +334,16 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
                 Ok(ir_text) => Ok(serde_json::json!({ "uri": p.uri, "ir": ir_text })),
                 Err(e) => Err(RpcError::internal(e)),
             },
+            Err(e) => Err(RpcError::invalid_params(e.to_string())),
+        },
+        "lineage/expand" => match serde_json::from_value::<ExpandParams>(req.params) {
+            Ok(p) => {
+                let cancel = Arc::new(AtomicBool::new(false));
+                state
+                    .engine
+                    .expand_node(&p, &cancel)
+                    .map(|res| serde_json::to_value(res).unwrap())
+            }
             Err(e) => Err(RpcError::invalid_params(e.to_string())),
         },
         other => Err(RpcError::method_not_found(other)),

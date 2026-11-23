@@ -41,6 +41,8 @@ fn slice_at_cursor(marked_src: &str) -> SliceEnvelope {
                 offset_encoding: OffsetEncoding::Utf8,
                 direction: SliceDirection::To,
                 include_graph: true,
+                include_focus: false,
+                include_tree: false,
                 include_snippets: true,
                 exclude_tests: false,
                 query_id: Some(1),

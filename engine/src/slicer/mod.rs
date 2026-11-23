@@ -18,17 +18,18 @@ use crate::ir::{
     STATE_NULL, STATE_PRESENT, STATE_UNDEFINED,
 };
 use crate::protocol::schema::{
-    CanonicalPos, CanonicalRange, FileEntry, HoverItem, HoverRisk, LspPosition,
-    LspResolveBatchParams, LspResolveItem, LspResolveKind, OffsetEncoding, RpcError, SliceEnvelope,
-    SliceParams, SliceProjections, SliceStats, TruncationReason, UnknownBoundary, UnknownReason,
-    SCHEMA_VERSION,
+    CanonicalPos, CanonicalRange, ExpandParams, ExpandResult, FileEntry, HoverItem, HoverRisk,
+    LspPosition, LspResolveBatchParams, LspResolveItem, LspResolveKind, OffsetEncoding, RpcError,
+    SliceDirection, SliceEnvelope, SliceParams, SliceProjections, SliceStats, TruncationReason,
+    UnknownBoundary, UnknownReason, SCHEMA_VERSION,
 };
+use crate::resolver::discover_callers;
 use crate::resolver::lsp_provider::{
     DEFAULT_LSP_TIMEOUT_MS, MAX_IMPLEMENTATION_TARGETS, PHASE2_CEILING_MS,
 };
 use crate::resolver::SymbolResolver;
 use crate::slicer::pipeline::{run_reduction_pipeline, RawSliceEdge, RawSliceNode};
-use crate::slicer::projectors::project_hover_card;
+use crate::slicer::projectors::{project_focus_spans, project_hover_card, project_tree_rows};
 use crate::text::PositionMapper;
 
 pub struct SlicerEngine {
@@ -174,7 +175,7 @@ impl SlicerEngine {
         let mut file_ids: HashMap<String, u32> = HashMap::new();
         file_ids.insert(params.uri.clone(), 0);
 
-        let eval = self.evaluate_function_ir(
+        let mut eval = self.evaluate_function_ir(
             &params.uri,
             &skeleton,
             &fn_ir,
@@ -186,6 +187,77 @@ impl SlicerEngine {
             start,
             params.include_snippets,
         );
+
+        let mut extra_truncation: Vec<TruncationReason> = Vec::new();
+        if matches!(
+            params.direction,
+            SliceDirection::From | SliceDirection::Both
+        ) && fn_ir.name != "<module>"
+        {
+            if params.lsp_attached {
+                eval.pending_lsp_items.push(LspResolveItem {
+                    key: fn_ir.name.clone(),
+                    uri: params.uri.clone(),
+                    position: params.position,
+                    offset_encoding: params.offset_encoding,
+                    kind: LspResolveKind::CallHierarchyIncoming,
+                });
+            } else {
+                let target_path = uri_to_path(&params.uri);
+                let ws_root = params
+                    .workspace_root
+                    .as_deref()
+                    .map(Path::new)
+                    .or_else(|| target_path.parent())
+                    .unwrap_or_else(|| Path::new("."));
+                let scan = discover_callers(ws_root, &fn_ir.name, &target_path, params.exclude_tests);
+                if let Some(reason) = scan.truncated {
+                    extra_truncation.push(reason);
+                }
+                let root_id = eval
+                    .root_ids
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "n0".to_string());
+                for (idx, caller) in scan.callers.into_iter().enumerate() {
+                    let fid = if let Some(&existing) = file_ids.get(&caller.uri) {
+                        existing
+                    } else {
+                        let id = files.len() as u32;
+                        files.push(FileEntry {
+                            file_id: id,
+                            uri: caller.uri.clone(),
+                        });
+                        file_ids.insert(caller.uri.clone(), id);
+                        id
+                    };
+                    let caller_id = format!("caller:{fid}:{idx}");
+                    eval.raw_nodes.push(RawSliceNode {
+                        id: caller_id.clone(),
+                        file_id: fid,
+                        is_test_file: caller.is_test_file,
+                        is_copy_passthrough: false,
+                        range: caller.range,
+                        label: format!("{} -> {}", caller.caller_name, fn_ir.name),
+                        snippet: if params.include_snippets {
+                            caller.snippet
+                        } else {
+                            None
+                        },
+                        absence: eval.target_absence.to_summary(),
+                        provenance: "ripgrep_caller".to_string(),
+                    });
+                    eval.raw_edges.push(RawSliceEdge {
+                        from: root_id.clone(),
+                        to: caller_id,
+                        label: Some("called_by".to_string()),
+                        is_back_edge: false,
+                        cycle_group_id: None,
+                        provenance: "ripgrep_caller".to_string(),
+                    });
+                }
+            }
+        }
 
         let phase1_ms = start.elapsed().as_millis() as u64;
         let phase1_budget = Duration::from_millis(50);
@@ -200,6 +272,11 @@ impl SlicerEngine {
         );
 
         let mut truncation = pipeline_out.truncation;
+        for reason in extra_truncation {
+            if !truncation.contains(&reason) {
+                truncation.push(reason);
+            }
+        }
         if cancel.load(Ordering::Relaxed) {
             truncation.push(TruncationReason::Cancelled);
         }
@@ -220,6 +297,20 @@ impl SlicerEngine {
             eval.unknown_boundaries.clone(),
             &truncation,
         );
+        let focus_spans = if params.include_focus {
+            Some(project_focus_spans(&pipeline_out.graph, &files))
+        } else {
+            None
+        };
+        let tree_rows = if params.include_tree {
+            Some(project_tree_rows(
+                &eval.root_ids,
+                &pipeline_out.graph,
+                &files,
+            ))
+        } else {
+            None
+        };
 
         let phase1_envelope = SliceEnvelope {
             schema_version: SCHEMA_VERSION,
@@ -235,6 +326,8 @@ impl SlicerEngine {
             },
             projections: SliceProjections {
                 hover_card: Some(hover_card),
+                focus_spans,
+                tree_rows,
             },
             truncation: truncation.clone(),
             stats: SliceStats {
@@ -403,12 +496,14 @@ impl SlicerEngine {
                     direction: params.direction,
                     files,
                     graph: if params.include_graph {
-                        Some(pipeline_out.graph)
+                        Some(pipeline_out.graph.clone())
                     } else {
                         None
                     },
                     projections: SliceProjections {
                         hover_card: Some(updated_card),
+                        focus_spans: phase1_envelope.projections.focus_spans.clone(),
+                        tree_rows: phase1_envelope.projections.tree_rows.clone(),
                     },
                     truncation,
                     stats: SliceStats {
@@ -918,6 +1013,8 @@ impl SlicerEngine {
             graph: None,
             projections: SliceProjections {
                 hover_card: Some(card),
+                focus_spans: None,
+                tree_rows: None,
             },
             truncation: Vec::new(),
             stats: SliceStats {
@@ -925,6 +1022,36 @@ impl SlicerEngine {
                 ..Default::default()
             },
         }
+    }
+
+    pub fn expand_node(
+        &self,
+        params: &ExpandParams,
+        cancel: &AtomicBool,
+    ) -> Result<ExpandResult, RpcError> {
+        let slice_params = SliceParams {
+            uri: params.uri.clone(),
+            position: params.position,
+            offset_encoding: params.offset_encoding,
+            direction: params.direction,
+            include_graph: false,
+            include_focus: false,
+            include_tree: true,
+            include_snippets: true,
+            exclude_tests: params.exclude_tests,
+            query_id: None,
+            lsp_attached: params.lsp_attached,
+            lsp_client_name: None,
+            workspace_root: params.workspace_root.clone(),
+        };
+        let env = self.slice_query::<fn(SliceEnvelope)>(&slice_params, "expand", cancel, None)?;
+        let tree_rows = env.projections.tree_rows.unwrap_or_default();
+        Ok(ExpandResult {
+            schema_version: SCHEMA_VERSION,
+            tree_rows,
+            files: env.files,
+            truncation: env.truncation,
+        })
     }
 
     pub fn dump_ir_text(&self, uri: &str) -> Result<String, String> {

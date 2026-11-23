@@ -151,6 +151,8 @@ fn main() {
                     CliDirection::From => SliceDirection::From,
                 },
                 include_graph: include_graph || matches!(format, CliFormat::Dot),
+                include_focus: false,
+                include_tree: false,
                 include_snippets: true,
                 exclude_tests: false,
                 query_id: Some(1),

@@ -437,6 +437,8 @@ fn test_transport_initialize_and_dirty_sync() {
                 offset_encoding: OffsetEncoding::Utf8,
                 direction: SliceDirection::To,
                 include_graph: false,
+                include_focus: false,
+                include_tree: false,
                 include_snippets: true,
                 exclude_tests: false,
                 query_id: Some(99),

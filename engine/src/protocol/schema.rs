@@ -136,6 +136,7 @@ pub enum SliceDirection {
     #[default]
     To,
     From,
+    Both,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +174,10 @@ pub struct SliceParams {
     pub direction: SliceDirection,
     #[serde(default)]
     pub include_graph: bool,
+    #[serde(default)]
+    pub include_focus: bool,
+    #[serde(default)]
+    pub include_tree: bool,
     #[serde(default = "default_true")]
     pub include_snippets: bool,
     #[serde(default)]
@@ -255,6 +260,7 @@ pub enum NodeKind {
     SourceNode,
     ContractedChain,
     FrontierNode,
+    ClusterNode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,10 +354,72 @@ pub struct HoverCardProjection {
     pub unverified_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusSpan {
+    pub file_id: u32,
+    pub uri: String,
+    pub range: CanonicalRange,
+    pub role: String,
+    pub badge: String,
+    pub highlight: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeRow {
+    pub node_id: String,
+    pub depth: u32,
+    pub file_id: u32,
+    pub uri: String,
+    pub range: CanonicalRange,
+    pub label: String,
+    pub badge: String,
+    pub is_cycle: bool,
+    pub is_frontier: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expansion_token: Option<String>,
+    pub is_absent: bool,
+    pub group_key: String,
+    pub provenance: String,
+    #[serde(default)]
+    pub has_children: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpandParams {
+    pub expansion_token: String,
+    pub uri: String,
+    pub position: LspPosition,
+    #[serde(default)]
+    pub offset_encoding: OffsetEncoding,
+    #[serde(default)]
+    pub direction: SliceDirection,
+    #[serde(default)]
+    pub exclude_tests: bool,
+    #[serde(default)]
+    pub lsp_attached: bool,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpandResult {
+    pub schema_version: u32,
+    pub tree_rows: Vec<TreeRow>,
+    pub files: Vec<FileEntry>,
+    pub truncation: Vec<TruncationReason>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SliceProjections {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hover_card: Option<HoverCardProjection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_spans: Option<Vec<FocusSpan>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tree_rows: Option<Vec<TreeRow>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -393,6 +461,8 @@ pub enum LspResolveKind {
     Definition,
     TypeDefinition,
     Implementation,
+    CallHierarchyIncoming,
+    References,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::AbsenceValue;
 use crate::protocol::schema::{
-    CanonicalRange, FileEntry, HoverCardProjection, HoverItem, HoverRisk, TruncationReason,
-    UnknownBoundary,
+    CanonicalRange, FileEntry, FocusSpan, HoverCardProjection, HoverItem, HoverRisk, NodeKind,
+    SliceGraph, TreeRow, TruncationReason, UnknownBoundary,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -114,4 +114,182 @@ pub fn project_hover_card(
         unknown_boundaries,
         unverified_count,
     }
+}
+
+pub fn project_focus_spans(graph: &SliceGraph, files: &[FileEntry]) -> Vec<FocusSpan> {
+    let file_map: HashMap<u32, &str> = files.iter().map(|f| (f.file_id, f.uri.as_str())).collect();
+    // Deduplicate by (file_id, start_line), keeping highest-severity state:
+    // absent (2) > unknown (1) > present (0).
+    let mut by_line: HashMap<(u32, u32), (u8, FocusSpan)> = HashMap::new();
+
+    for node in &graph.nodes {
+        let uri = file_map.get(&node.file_id).copied().unwrap_or("").to_string();
+        let is_absent =
+            node.absence.maybe_null || node.absence.maybe_undefined || !node.absence.present;
+        let is_unknown = !node.absence.unknown_reasons.is_empty();
+        let (severity, badge, highlight) = if is_absent {
+            (2u8, "[NULL]".to_string(), "LineageStateAbsent".to_string())
+        } else if is_unknown {
+            (1u8, "[?]".to_string(), "LineageStateUnknown".to_string())
+        } else {
+            (0u8, "[OK]".to_string(), "LineageStatePresent".to_string())
+        };
+
+        let role = if node.label.starts_with("narrow ") {
+            "narrow".to_string()
+        } else if is_unknown {
+            "unknown".to_string()
+        } else {
+            node.provenance.clone()
+        };
+
+        let span = FocusSpan {
+            file_id: node.file_id,
+            uri,
+            range: node.range,
+            role,
+            badge,
+            highlight,
+            label: node.label.clone(),
+        };
+
+        let key = (node.file_id, node.range.start.line);
+        match by_line.get(&key) {
+            Some((existing_sev, _)) if *existing_sev >= severity => {}
+            _ => {
+                by_line.insert(key, (severity, span));
+            }
+        }
+    }
+
+    let mut spans: Vec<FocusSpan> = by_line.into_values().map(|(_, s)| s).collect();
+    spans.sort_by(|a, b| {
+        a.file_id
+            .cmp(&b.file_id)
+            .then_with(|| a.range.start.cmp(&b.range.start))
+    });
+    spans
+}
+
+pub fn project_tree_rows(
+    root_ids: &[String],
+    graph: &SliceGraph,
+    files: &[FileEntry],
+) -> Vec<TreeRow> {
+    let file_map: HashMap<u32, &str> = files.iter().map(|f| (f.file_id, f.uri.as_str())).collect();
+    let node_map: HashMap<&str, &crate::protocol::schema::FlowNode> =
+        graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut adj: HashMap<&str, Vec<&crate::protocol::schema::FlowEdge>> = HashMap::new();
+    for edge in &graph.edges {
+        adj.entry(edge.from.as_str()).or_default().push(edge);
+    }
+
+    let mut rows = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    #[allow(clippy::too_many_arguments)]
+    fn dfs<'a>(
+        node_id: &'a str,
+        depth: u32,
+        is_cycle: bool,
+        root_origin: &str,
+        file_map: &HashMap<u32, &str>,
+        node_map: &HashMap<&str, &'a crate::protocol::schema::FlowNode>,
+        adj: &HashMap<&str, Vec<&'a crate::protocol::schema::FlowEdge>>,
+        visited: &mut HashSet<String>,
+        rows: &mut Vec<TreeRow>,
+    ) {
+        let Some(node) = node_map.get(node_id).copied() else {
+            return;
+        };
+        let uri = file_map.get(&node.file_id).copied().unwrap_or("").to_string();
+        let is_absent =
+            node.absence.maybe_null || node.absence.maybe_undefined || !node.absence.present;
+        let is_unknown = !node.absence.unknown_reasons.is_empty();
+        let state_badge = if is_absent {
+            "[NULL]"
+        } else if is_unknown {
+            "[?]"
+        } else {
+            "[OK]"
+        };
+        let is_frontier = matches!(node.kind, NodeKind::FrontierNode | NodeKind::ClusterNode);
+        let badge = if is_cycle {
+            format!("{state_badge} [cycle]")
+        } else if is_frontier {
+            format!("{state_badge} [+]")
+        } else {
+            state_badge.to_string()
+        };
+
+        let expansion_token = if is_frontier {
+            Some(format!(
+                "exp:{}:{}:{}",
+                node.id, node.file_id, node.range.start.line
+            ))
+        } else {
+            None
+        };
+
+        let outgoing = adj.get(node.id.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+        let has_children = !is_cycle && !outgoing.is_empty();
+
+        rows.push(TreeRow {
+            node_id: node.id.clone(),
+            depth,
+            file_id: node.file_id,
+            uri,
+            range: node.range,
+            label: node.label.clone(),
+            badge,
+            is_cycle,
+            is_frontier,
+            expansion_token,
+            is_absent,
+            group_key: root_origin.to_string(),
+            provenance: node.provenance.clone(),
+            has_children,
+            snippet: node.snippet.clone(),
+        });
+
+        if is_cycle || is_frontier {
+            return;
+        }
+
+        for edge in outgoing {
+            let cycle_hit = edge.is_back_edge || !visited.insert(edge.to.clone());
+            dfs(
+                edge.to.as_str(),
+                depth + 1,
+                cycle_hit,
+                root_origin,
+                file_map,
+                node_map,
+                adj,
+                visited,
+                rows,
+            );
+        }
+    }
+
+    for root in root_ids {
+        if let Some(root_node) = node_map.get(root.as_str()) {
+            let origin = root_node.label.clone();
+            if visited.insert(root.clone()) {
+                dfs(
+                    root.as_str(),
+                    0,
+                    false,
+                    &origin,
+                    &file_map,
+                    &node_map,
+                    &adj,
+                    &mut visited,
+                    &mut rows,
+                );
+            }
+        }
+    }
+
+    rows
 }
