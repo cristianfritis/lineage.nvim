@@ -6,6 +6,8 @@ local METHOD_MAP = {
   definition = "textDocument/definition",
   typeDefinition = "textDocument/typeDefinition",
   implementation = "textDocument/implementation",
+  references = "textDocument/references",
+  callHierarchyIncoming = "textDocument/prepareCallHierarchy",
 }
 
 local active_lsp_requests = {}
@@ -78,6 +80,29 @@ local function normalize_locations(result)
   return out
 end
 
+local function normalize_call_hierarchy_incoming(result)
+  local out = {}
+  if not result or not vim.islist(result) then
+    return out
+  end
+  for _, entry in ipairs(result) do
+    local from = entry.from
+    if from and from.uri then
+      local range = (entry.fromRanges and entry.fromRanges[1])
+        or from.selectionRange
+        or from.range
+      if range and range.start and range["end"] then
+        table.insert(out, {
+          uri = from.uri,
+          start = { line = range.start.line, character = range.start.character },
+          ["end"] = { line = range["end"].line, character = range["end"].character },
+        })
+      end
+    end
+  end
+  return out
+end
+
 function M.pick_client(bufnr, lsp_method, circuit_open_clients)
   local clients = M.get_clients(bufnr)
   for _, client in ipairs(clients) do
@@ -144,11 +169,24 @@ function M.resolve_batch(params, circuit_open_clients, callback)
   end
 
   local uv = vim.uv or vim.loop
-  for idx, item in ipairs(items) do
-    local bufnr = vim.uri_to_bufnr(item.uri)
-    local lsp_method = METHOD_MAP[item.kind] or "textDocument/definition"
-    local client = M.pick_client(bufnr, lsp_method, circuit_open_clients)
-    if not client then
+
+  local function record_result(idx, item, client, locs, elapsed_ms)
+    results[idx] = {
+      key = item.key,
+      locations = locs,
+      timed_out = false,
+      unattached = false,
+      circuit_open = false,
+      client_name = client and client.name or nil,
+      offset_encoding = (client and client.offset_encoding) or "utf-16",
+      latency_ms = elapsed_ms,
+    }
+    finish_one()
+  end
+
+  local function send_references(idx, item, bufnr, t0)
+    local ref_client = M.pick_client(bufnr, "textDocument/references", circuit_open_clients)
+    if not ref_client then
       results[idx] = {
         key = item.key,
         locations = {},
@@ -158,44 +196,100 @@ function M.resolve_batch(params, circuit_open_clients, callback)
         latency_ms = 0,
       }
       finish_one()
+      return
+    end
+    local ref_params = {
+      textDocument = { uri = item.uri },
+      position = { line = item.position.line, character = item.position.character },
+      context = { includeDeclaration = false },
+    }
+    local ok, req_id = M.client_request(ref_client, "textDocument/references", ref_params, function(err, res)
+      if finished then
+        return
+      end
+      local elapsed_ms = math.floor((uv.hrtime() - t0) / 1e6)
+      local locs = (not err and res) and normalize_locations(res) or {}
+      record_result(idx, item, ref_client, locs, elapsed_ms)
+    end, bufnr)
+    if ok and req_id and active_lsp_requests[query_id] then
+      table.insert(active_lsp_requests[query_id], { client = ref_client, req_id = req_id })
+    end
+  end
+
+  for idx, item in ipairs(items) do
+    local bufnr = vim.uri_to_bufnr(item.uri)
+    local t0 = uv.hrtime()
+
+    if item.kind == "callHierarchyIncoming" then
+      local ch_client = M.pick_client(bufnr, "textDocument/prepareCallHierarchy", circuit_open_clients)
+      if not ch_client then
+        send_references(idx, item, bufnr, t0)
+      else
+        local prep_params = {
+          textDocument = { uri = item.uri },
+          position = { line = item.position.line, character = item.position.character },
+        }
+        local ok, req_id = M.client_request(ch_client, "textDocument/prepareCallHierarchy", prep_params, function(err, prep_res)
+          if finished then
+            return
+          end
+          local ch_items = (not err and prep_res and vim.islist(prep_res)) and prep_res or {}
+          if #ch_items == 0 then
+            send_references(idx, item, bufnr, t0)
+            return
+          end
+          local ok2, req_id2 = M.client_request(ch_client, "callHierarchy/incomingCalls", { item = ch_items[1] }, function(err2, inc_res)
+            if finished then
+              return
+            end
+            local locs = (not err2 and inc_res) and normalize_call_hierarchy_incoming(inc_res) or {}
+            if #locs == 0 then
+              send_references(idx, item, bufnr, t0)
+              return
+            end
+            local elapsed_ms = math.floor((uv.hrtime() - t0) / 1e6)
+            record_result(idx, item, ch_client, locs, elapsed_ms)
+          end, bufnr)
+          if ok2 and req_id2 and active_lsp_requests[query_id] then
+            table.insert(active_lsp_requests[query_id], { client = ch_client, req_id = req_id2 })
+          end
+        end, bufnr)
+        if ok and req_id and active_lsp_requests[query_id] then
+          table.insert(active_lsp_requests[query_id], { client = ch_client, req_id = req_id })
+        end
+      end
     else
-      local t0 = uv.hrtime()
-      local req_params = {
-        textDocument = { uri = item.uri },
-        position = { line = item.position.line, character = item.position.character },
-      }
-      local ok, req_id = M.client_request(client, lsp_method, req_params, function(err, res)
-        if finished then
-          return
-        end
-        local elapsed_ms = math.floor((uv.hrtime() - t0) / 1e6)
-        if err then
-          results[idx] = {
-            key = item.key,
-            locations = {},
-            timed_out = false,
-            unattached = false,
-            circuit_open = false,
-            client_name = client.name,
-            offset_encoding = client.offset_encoding or "utf-16",
-            latency_ms = elapsed_ms,
-          }
-        else
-          results[idx] = {
-            key = item.key,
-            locations = normalize_locations(res),
-            timed_out = false,
-            unattached = false,
-            circuit_open = false,
-            client_name = client.name,
-            offset_encoding = client.offset_encoding or "utf-16",
-            latency_ms = elapsed_ms,
-          }
-        end
+      local lsp_method = METHOD_MAP[item.kind] or "textDocument/definition"
+      local client = M.pick_client(bufnr, lsp_method, circuit_open_clients)
+      if not client then
+        results[idx] = {
+          key = item.key,
+          locations = {},
+          timed_out = false,
+          unattached = true,
+          circuit_open = false,
+          latency_ms = 0,
+        }
         finish_one()
-      end, bufnr)
-      if ok and req_id then
-        table.insert(active_lsp_requests[query_id], { client = client, req_id = req_id })
+      else
+        local req_params = {
+          textDocument = { uri = item.uri },
+          position = { line = item.position.line, character = item.position.character },
+        }
+        if item.kind == "references" then
+          req_params.context = { includeDeclaration = false }
+        end
+        local ok, req_id = M.client_request(client, lsp_method, req_params, function(err, res)
+          if finished then
+            return
+          end
+          local elapsed_ms = math.floor((uv.hrtime() - t0) / 1e6)
+          local locs = (not err and res) and normalize_locations(res) or {}
+          record_result(idx, item, client, locs, elapsed_ms)
+        end, bufnr)
+        if ok and req_id and active_lsp_requests[query_id] then
+          table.insert(active_lsp_requests[query_id], { client = client, req_id = req_id })
+        end
       end
     end
   end
