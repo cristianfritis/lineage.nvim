@@ -7,6 +7,8 @@ use crate::ir::{
 };
 use crate::protocol::schema::{CanonicalPos, CanonicalRange, UnknownReason};
 
+pub mod python;
+pub mod rust;
 pub mod typescript;
 
 /// Pluggable language adapter contract for parsing, lowering, stdlib summaries,

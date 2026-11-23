@@ -7,6 +7,8 @@ use tracing_appender::rolling;
 use tracing_subscriber::fmt;
 use tracing_subscriber::EnvFilter;
 
+use lineage_engine::adapters::python::PythonAdapter;
+use lineage_engine::adapters::rust::RustAdapter;
 use lineage_engine::adapters::typescript::TypeScriptAdapter;
 use lineage_engine::adapters::{LanguageAdapter, StubAdapter};
 use lineage_engine::cache::{
@@ -36,7 +38,12 @@ fn init_logging(log_dir: Option<&PathBuf>) -> Option<String> {
 }
 
 fn default_adapters() -> Vec<Arc<dyn LanguageAdapter>> {
-    vec![Arc::new(TypeScriptAdapter::new()), Arc::new(StubAdapter)]
+    vec![
+        Arc::new(TypeScriptAdapter::new()),
+        Arc::new(PythonAdapter::new()),
+        Arc::new(RustAdapter::new()),
+        Arc::new(StubAdapter),
+    ]
 }
 
 fn build_engine(resolver: Arc<dyn SymbolResolver>) -> Arc<SlicerEngine> {
