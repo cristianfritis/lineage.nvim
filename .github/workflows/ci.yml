@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Cargo test
+        working-directory: engine
+        run: cargo test
+      - name: Cargo clippy
+        working-directory: engine
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Cargo fmt check
+        working-directory: engine
+        run: cargo fmt --check
+
+  neovim:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        nvim-version: ["v0.10.4", "v0.11.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build lineage-engine
+        working-directory: engine
+        run: cargo build --release
+      - name: Setup Neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.nvim-version }}
+      - name: Stylua check
+        uses: JohnnyMorganz/stylua-action@v4
+        with:
+          args: --check plugin lua tests
+      - name: Run headless Neovim tests
+        run: |
+          for t in tests/test_*.lua; do
+            nvim --headless -u tests/minimal_init.lua -l "$t"
+          done
