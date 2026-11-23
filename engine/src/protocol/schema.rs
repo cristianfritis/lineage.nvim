@@ -102,11 +102,13 @@ impl RpcNotification {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
 pub enum OffsetEncoding {
     #[default]
+    #[serde(rename = "utf-8", alias = "utf8")]
     Utf8,
+    #[serde(rename = "utf-16", alias = "utf16")]
     Utf16,
+    #[serde(rename = "utf-32", alias = "utf32")]
     Utf32,
 }
 

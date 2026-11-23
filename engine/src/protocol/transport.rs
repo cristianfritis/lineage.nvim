@@ -14,7 +14,8 @@ use crate::protocol::schema::{
     RpcNotification, RpcRequest, RpcResponse, SliceParams, StatusResult, SyncBufferParams,
     PROTOCOL_VERSION, SCHEMA_VERSION,
 };
-use crate::resolver::lsp_provider::ReverseRpcSender;
+use crate::resolver::ewma::EwmaTracker;
+use crate::resolver::lsp_provider::{ReverseRpcSender, StdioLspProvider};
 use crate::slicer::SlicerEngine;
 
 pub struct TransportState {
@@ -118,7 +119,18 @@ impl TransportState {
 
 pub fn serve_stdio(engine: Arc<SlicerEngine>, log_path: Option<String>) {
     let (out_tx, out_rx) = unbounded::<String>();
-    let state = TransportState::new(engine, log_path, out_tx);
+    let state = TransportState::new(engine.clone(), log_path, out_tx);
+    let reverse_sender = state.make_reverse_rpc_sender();
+    let ewma = Arc::new(EwmaTracker::new());
+    let workspace_root = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    engine.set_resolver(Arc::new(StdioLspProvider::new(
+        reverse_sender,
+        ewma,
+        workspace_root,
+        "neovim-lsp".to_string(),
+    )));
 
     // Dedicated stdout writer thread (stdout isolation: NDJSON frames only).
     let writer_handle = thread::spawn(move || {
@@ -292,9 +304,8 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
         },
         "lineage/status" => {
             let (dirty_buffers, dirty_bytes) = state.engine.dirty_buffers.stats();
-            let ewma_clients = state
-                .engine
-                .resolver
+            let resolver = state.engine.resolver();
+            let ewma_clients = resolver
                 .ewma_tracker()
                 .map(|t| t.snapshots())
                 .unwrap_or_default();

@@ -48,8 +48,8 @@ echo "[m1_gate] Checking steady-state RSS via /usr/bin/time or ps..."
 echo "[m1_gate] Note: Full external-repo gate (zod, trpc, TypeScript) requires cloning those repos into \$LINEAGE_BENCH_CORPUS."
 if [[ -n "${LINEAGE_BENCH_CORPUS:-}" && -d "$LINEAGE_BENCH_CORPUS" ]]; then
   echo "[m1_gate] Scanning $LINEAGE_BENCH_CORPUS..."
-  find "$LINEAGE_BENCH_CORPUS" -maxdepth 4 -name "*.ts" | head -n 50 | while read -r f; do
+  while IFS= read -r f; do
     "$ENGINE_BIN" slice "${f}:1:0" --format json >/dev/null || true
-  done
+  done < <(find "$LINEAGE_BENCH_CORPUS" -maxdepth 4 -name "*.ts" | head -n 50 || true)
 fi
 echo "[m1_gate] Gate script completed."

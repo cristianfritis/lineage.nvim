@@ -2,10 +2,10 @@ pub mod pipeline;
 pub mod projectors;
 pub mod scc;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::adapters::{ImportResolution, LanguageAdapter};
@@ -34,7 +34,7 @@ use crate::text::PositionMapper;
 pub struct SlicerEngine {
     pub cache: Arc<FileIrCache>,
     pub dirty_buffers: Arc<DirtyBufferOverlay>,
-    pub resolver: Arc<dyn SymbolResolver>,
+    resolver: RwLock<Arc<dyn SymbolResolver>>,
     pub adapters: Vec<Arc<dyn LanguageAdapter>>,
 }
 
@@ -48,9 +48,17 @@ impl SlicerEngine {
         Self {
             cache,
             dirty_buffers,
-            resolver,
+            resolver: RwLock::new(resolver),
             adapters,
         }
+    }
+
+    pub fn resolver(&self) -> Arc<dyn SymbolResolver> {
+        self.resolver.read().expect("resolver read lock").clone()
+    }
+
+    pub fn set_resolver(&self, resolver: Arc<dyn SymbolResolver>) {
+        *self.resolver.write().expect("resolver write lock") = resolver;
     }
 
     pub fn adapter_for_uri(&self, uri: &str) -> Option<&Arc<dyn LanguageAdapter>> {
@@ -240,8 +248,8 @@ impl SlicerEngine {
             },
         };
 
-        // Phase 2: if open LSP-resolvable boundaries exist and not cancelled
-        if !eval.pending_lsp_items.is_empty() && !cancel.load(Ordering::Relaxed) {
+        // Phase 2: if LSP is attached and open LSP-resolvable boundaries exist and not cancelled
+        if params.lsp_attached && !eval.pending_lsp_items.is_empty() && !cancel.load(Ordering::Relaxed) {
             if let Some(ref mut emit_delta) = on_delta {
                 let batch = LspResolveBatchParams {
                     query_id,
@@ -250,7 +258,7 @@ impl SlicerEngine {
                     timeout_ms: DEFAULT_LSP_TIMEOUT_MS,
                     items: eval.pending_lsp_items.clone(),
                 };
-                let batch_res = self.resolver.resolve_batch(batch, Instant::now());
+                let batch_res = self.resolver().resolve_batch(batch, Instant::now());
                 let mut phase2_items = Vec::new();
                 let mut updated_boundaries = eval.unknown_boundaries.clone();
                 let mut resolved_absence = eval.target_absence;
@@ -316,8 +324,8 @@ impl SlicerEngine {
                             },
                         };
 
-                        // If target is a .d.ts stub, extract outer-wrapper signature
-                        if loc.uri.ends_with(".d.ts") {
+                        // If target is a .d.ts or .pyi stub, extract outer-wrapper signature
+                        if loc.uri.ends_with(".d.ts") || loc.uri.ends_with(".pyi") {
                             if let Ok((stub_text, _)) = self.load_source(&loc.uri) {
                                 let stub_mapper = PositionMapper::new(&stub_text);
                                 let enc = item_res.offset_encoding.unwrap_or(OffsetEncoding::Utf16);
@@ -420,6 +428,45 @@ impl SlicerEngine {
         Ok(phase1_envelope)
     }
 
+    fn backward_reachable(fn_ir: &FunctionIr, target: ValueId) -> HashSet<ValueId> {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(target);
+        queue.push_back(target);
+
+        while let Some(vid) = queue.pop_front() {
+            let Some(inst) = fn_ir.inst(vid) else {
+                continue;
+            };
+            match &inst.op {
+                SsiOp::Assign { src } | SsiOp::Pi { src, .. } => {
+                    if visited.insert(*src) {
+                        queue.push_back(*src);
+                    }
+                }
+                SsiOp::Phi { incoming } => {
+                    for &(_b, src) in incoming {
+                        if visited.insert(src) {
+                            queue.push_back(src);
+                        }
+                    }
+                }
+                SsiOp::ProjectField { base, .. }
+                | SsiOp::ProjectIndex { base, .. }
+                | SsiOp::UnwrapVariant { base, .. } => {
+                    if visited.insert(*base) {
+                        queue.push_back(*base);
+                    }
+                }
+                SsiOp::Const { .. }
+                | SsiOp::Param { .. }
+                | SsiOp::Call { .. }
+                | SsiOp::UnknownOp { .. } => {}
+            }
+        }
+        visited
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn evaluate_function_ir(
         &self,
@@ -445,21 +492,31 @@ impl SlicerEngine {
         let mut unknown_external_generic_calls = 0usize;
         let mut total_external_generic_calls = 0usize;
 
+        let reachable = Self::backward_reachable(fn_ir, target_vid);
+
         for block in &fn_ir.blocks {
             let mut guard_env = if block.preds.len() == 1 {
                 block_envs.get(&block.preds[0]).cloned().unwrap_or_default()
             } else {
                 GuardEnv::new()
             };
+            let block_in_slice = block.insts.iter().any(|vid| reachable.contains(vid));
             for g in &block.guards {
                 guard_env.add_fact(g.clone());
-                guards_desc.push(format!("{g:?}"));
+                if block_in_slice {
+                    guards_desc.push(format!("{g:?}"));
+                }
             }
             block_envs.insert(block.id, guard_env.clone());
             for &vid in &block.insts {
                 let Some(inst) = fn_ir.inst(vid) else {
                     continue;
                 };
+                let in_slice = reachable.contains(&vid);
+                let mut dummy_bounds = Vec::new();
+                let mut dummy_lsp = Vec::new();
+                let mut dummy_unk = 0usize;
+                let mut dummy_tot = 0usize;
                 let val = self.eval_inst(
                     inst,
                     uri,
@@ -471,22 +528,24 @@ impl SlicerEngine {
                     file_ids,
                     workspace_root,
                     start,
-                    &mut unknown_boundaries,
-                    &mut pending_lsp_items,
-                    &mut unknown_external_generic_calls,
-                    &mut total_external_generic_calls,
+                    if in_slice { &mut unknown_boundaries } else { &mut dummy_bounds },
+                    if in_slice { &mut pending_lsp_items } else { &mut dummy_lsp },
+                    if in_slice { &mut unknown_external_generic_calls } else { &mut dummy_unk },
+                    if in_slice { &mut total_external_generic_calls } else { &mut dummy_tot },
                 );
                 values.insert(vid, val);
-                self.record_inst_node(
-                    inst,
-                    val,
-                    uri,
-                    adapter,
-                    include_snippets,
-                    &mut raw_nodes,
-                    &mut raw_edges,
-                    &mut hover_items,
-                );
+                if in_slice {
+                    self.record_inst_node(
+                        inst,
+                        val,
+                        uri,
+                        adapter,
+                        include_snippets,
+                        &mut raw_nodes,
+                        &mut raw_edges,
+                        &mut hover_items,
+                    );
+                }
             }
         }
 
@@ -498,6 +557,7 @@ impl SlicerEngine {
         let local_risks: Vec<HoverRisk> = fn_ir
             .danger_sinks
             .iter()
+            .filter(|sink| sink.target == target_vid || reachable.contains(&sink.target))
             .filter_map(|sink| {
                 let sink_val = values.get(&sink.target).copied().unwrap_or_default();
                 if sink_val.is_maybe_absent() || sink_val.is_definitely_absent() {
@@ -589,10 +649,10 @@ impl SlicerEngine {
             }
             SsiOp::Call { callee, .. } => match callee {
                 CallTarget::Stdlib(sym) => {
+                    *total_ext_calls += 1;
                     if let Some(abs) = adapter.stdlib_summary(sym) {
                         abs
                     } else {
-                        *total_ext_calls += 1;
                         *unknown_ext_calls += 1;
                         unknown_boundaries.push(UnknownBoundary {
                             file_id: 0,
@@ -635,7 +695,7 @@ impl SlicerEngine {
                                 });
                                 file_ids.insert(target_uri.clone(), fid);
                             }
-                            if target_uri.ends_with(".d.ts") {
+                            if target_uri.ends_with(".d.ts") || target_uri.ends_with(".pyi") {
                                 if let Ok((stub_text, _)) = self.load_source(&target_uri) {
                                     if let Some(abs) = adapter.extract_declaration_signature(
                                         &target_uri,
@@ -711,8 +771,6 @@ impl SlicerEngine {
                     AbsenceValue::unknown(UnknownReason::ExternalUntyped)
                 }
                 CallTarget::Dynamic(sym) => {
-                    *total_ext_calls += 1;
-                    *unknown_ext_calls += 1;
                     unknown_boundaries.push(UnknownBoundary {
                         file_id: 0,
                         uri: uri.to_string(),

@@ -335,7 +335,6 @@ function M.open()
     local clients = lsp_compat.get_clients(origin_buf)
     local lsp_attached = #clients > 0
     local primary_client = clients[1]
-    local offset_enc = (primary_client and primary_client.offset_encoding) or "utf-16"
 
     client.on_delta(query_id, function(delta_env)
       M.apply_delta(delta_env, hover_id)
@@ -344,7 +343,7 @@ function M.open()
     client.request("lineage/slice", {
       uri = uri,
       position = { line = origin_pos[1] - 1, character = origin_pos[2] },
-      offset_encoding = offset_enc,
+      offset_encoding = "utf-8",
       direction = "to",
       include_graph = false,
       include_snippets = true,
