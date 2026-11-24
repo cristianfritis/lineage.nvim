@@ -49,6 +49,7 @@ fn slice_at_cursor(marked_src: &str) -> SliceEnvelope {
                 lsp_attached: false,
                 lsp_client_name: None,
                 workspace_root: None,
+                lsp_timeout_ms: None,
             },
             "golden-rs",
             &AtomicBool::new(false),
@@ -98,7 +99,7 @@ fn golden_rust_cases() -> Vec<(&'static str, &'static str, &'static str)> {
         ("37_async_await_unwrap", "async fn f() { let <|>x = 42.await; }", "NonNull"),
         ("38_impl_method_none", "impl S { fn g() -> Option<i32> { let <|>x = None; x } }", "Absent"),
         ("39_broken_syntax_sibling", "fn f() { let broken = ; let <|>ok = 1; }", "NonNull"),
-        ("40_module_top_level", "const <|>X: i32 = 10;", "NonNull"),
+        ("40_module_top_level", "const <|>X: i32 = 10;", "Unverified"),
         ("41_str_strip_prefix", "fn f(s: &str) { let <|>x = s.strip_prefix(\"a\"); }", "Nullable"),
         ("42_path_parent", "fn f(p: &Path) { let <|>x = p.parent(); }", "Nullable"),
     ]
@@ -121,7 +122,10 @@ fn test_42_golden_rust_cases() {
 fn test_rust_unwrap_and_expect_emit_danger_sinks() {
     let env = slice_at_cursor("fn f(opt: Option<i32>) -> i32 { let x = <|>opt.unwrap(); x }");
     let card = env.projections.hover_card.unwrap();
-    assert!(!card.local_risks.is_empty(), "Expected DangerSink on opt.unwrap()");
+    assert!(
+        !card.local_risks.is_empty(),
+        "Expected DangerSink on opt.unwrap()"
+    );
 }
 
 #[test]

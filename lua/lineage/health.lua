@@ -15,11 +15,25 @@ function M.check()
   end
 
   -- 2. Binary discovery
-  local bin = client.find_binary()
+  local bin, bin_source = client.find_binary()
+  local install = require("lineage.install")
+  local pinned = install.resolve_pinned_binary()
   if bin then
-    vim.health.ok("lineage-engine binary: " .. bin)
+    local tag_info = pinned and pinned.engine_tag or "unknown"
+    local prov = (pinned and pinned.path == bin) and pinned.provenance or "dev/custom"
+    vim.health.ok(
+      string.format(
+        "lineage-engine binary: %s [%s | engine_tag=%s | provenance=%s]",
+        bin,
+        bin_source or "unknown source",
+        tag_info,
+        prov
+      )
+    )
   else
-    vim.health.error("lineage-engine binary not found (run `cargo build --release` in engine/)")
+    vim.health.error(
+      "lineage-engine binary not found. Run :Lineage install (or `cargo build --release` in engine/)"
+    )
   end
 
   -- 3. Attached LSP clients
@@ -31,7 +45,13 @@ function M.check()
   else
     for _, c in ipairs(clients) do
       local caps = {}
-      for _, m in ipairs({ "definition", "typeDefinition", "implementation" }) do
+      for _, m in ipairs({
+        "definition",
+        "typeDefinition",
+        "implementation",
+        "prepareCallHierarchy",
+        "references",
+      }) do
         if lsp_compat.client_supports(c, "textDocument/" .. m) then
           table.insert(caps, m)
         end
@@ -76,11 +96,12 @@ function M.check()
       vim.health.info("Loaded grammars: " .. table.concat(status_res.loaded_grammars or {}, ", "))
       vim.health.info(
         string.format(
-          "LRU cache: %d / %d bytes | dirty buffers: %d (%d bytes)",
+          "LRU cache: %d / %d bytes | dirty buffers: %d (%d bytes) | rss_bytes: %s",
           status_res.cache_bytes or 0,
           status_res.cache_cap_bytes or 0,
           status_res.dirty_buffers or 0,
-          status_res.dirty_bytes or 0
+          status_res.dirty_bytes or 0,
+          status_res.rss_bytes and tostring(status_res.rss_bytes) or "n/a"
         )
       )
       if status_res.log_path then

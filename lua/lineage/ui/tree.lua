@@ -45,6 +45,9 @@ local function close_preview()
 end
 
 function M.close()
+  if state.query_id > 0 then
+    client.cancel_query(state.query_id)
+  end
   close_preview()
   if state.augroup then
     pcall(vim.api.nvim_del_augroup_by_id, state.augroup)
@@ -241,14 +244,8 @@ function M.render()
       or ""
     local line1 = (row.range and row.range.start and row.range.start.line or 0) + 1
     local loc = short_uri ~= "" and string.format("%s:%d", short_uri, line1) or ""
-    local text = string.format(
-      "%s%s%s %s  %s",
-      indent,
-      fold_icon,
-      row.badge or "[?]",
-      row.label or "",
-      loc
-    )
+    local text =
+      string.format("%s%s%s %s  %s", indent, fold_icon, row.badge or "[?]", row.label or "", loc)
     table.insert(lines, text)
     line_to_row[#lines] = row
 
@@ -265,8 +262,14 @@ function M.render()
 
   state.line_to_row = line_to_row
 
+  local safe_lines = {}
+  for _, l in ipairs(lines) do
+    local s = tostring(l):gsub("[\r\n]+", " ")
+    table.insert(safe_lines, s)
+  end
+
   vim.bo[state.bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(state.bufnr, 0, -1, false, lines)
+  vim.api.nvim_buf_set_lines(state.bufnr, 0, -1, false, safe_lines)
   vim.bo[state.bufnr].modifiable = false
 
   vim.api.nvim_buf_clear_namespace(state.bufnr, ns, 0, -1)
@@ -303,6 +306,7 @@ function M.expand_row(row)
     local lnum = row.range and row.range.start and row.range.start.line or 0
     local col = row.range and row.range.start and row.range.start.col or 0
     local uri = (row.uri and row.uri ~= "") and row.uri or state.origin_uri
+    local clients = lsp_compat.get_clients(state.origin_buf or 0)
     client.request("lineage/expand", {
       expansion_token = row.expansion_token,
       uri = uri,
@@ -310,7 +314,7 @@ function M.expand_row(row)
       offset_encoding = "utf-8",
       direction = state.direction,
       exclude_tests = state.exclude_tests,
-      lsp_attached = false,
+      lsp_attached = #clients > 0,
       workspace_root = vim.fn.getcwd(),
     }, function(req_err, res)
       if req_err or not res then
@@ -318,7 +322,7 @@ function M.expand_row(row)
       end
       state.expanded_children[row.node_id] = res.tree_rows or {}
       row.is_frontier = false
-      row.has_children = #(state.expanded_children[row.node_id]) > 0
+      row.has_children = #state.expanded_children[row.node_id] > 0
       M.render()
     end)
   end)
@@ -392,8 +396,12 @@ local function bind_keymaps(bufnr)
 end
 
 local function ensure_split()
-  if state.winid and vim.api.nvim_win_is_valid(state.winid)
-    and state.bufnr and vim.api.nvim_buf_is_valid(state.bufnr) then
+  if
+    state.winid
+    and vim.api.nvim_win_is_valid(state.winid)
+    and state.bufnr
+    and vim.api.nvim_buf_is_valid(state.bufnr)
+  then
     return
   end
 
@@ -443,8 +451,11 @@ function M.refresh()
   if not state.origin_uri or not state.origin_pos then
     return
   end
-  state.query_id = state.query_id + 1
-  local qid = state.query_id
+  if state.query_id > 0 then
+    client.cancel_query(state.query_id)
+  end
+  local qid = client.next_query_id()
+  state.query_id = qid
 
   client.ensure_started(function(err)
     if err or qid ~= state.query_id then
@@ -458,7 +469,30 @@ function M.refresh()
       sync.sync_if_dirty(state.origin_buf, client)
     end
     local clients = state.origin_buf and lsp_compat.get_clients(state.origin_buf) or {}
-    local primary_client = clients[1]
+    local primary_client = state.origin_buf
+        and (lsp_compat.pick_client(state.origin_buf, "textDocument/prepareCallHierarchy") or lsp_compat.pick_client(
+          state.origin_buf,
+          "textDocument/definition"
+        ))
+      or clients[1]
+    local cfg = config.get()
+
+    client.on_delta(qid, function(delta_env)
+      client.clear_delta(qid)
+      if qid ~= state.query_id then
+        return
+      end
+      local rows = (delta_env and delta_env.projections and delta_env.projections.tree_rows) or {}
+      local trunc = (delta_env and delta_env.truncation) or {}
+      if #rows > 0 then
+        ensure_split()
+        M.set_rows(
+          rows,
+          trunc,
+          { direction = state.direction, exclude_tests = state.exclude_tests }
+        )
+      end
+    end)
 
     client.request("lineage/slice", {
       uri = state.origin_uri,
@@ -473,13 +507,19 @@ function M.refresh()
       query_id = qid,
       lsp_attached = #clients > 0,
       lsp_client_name = primary_client and primary_client.name or nil,
+      lsp_timeout_ms = cfg.lsp and cfg.lsp.timeout_ms or 150,
       workspace_root = vim.fn.getcwd(),
     }, function(req_err, res)
       if qid ~= state.query_id then
+        client.clear_delta(qid)
         return
       end
       if req_err then
-        vim.notify("lineage.nvim: " .. (req_err.message or "tree slice failed"), vim.log.levels.ERROR)
+        client.clear_delta(qid)
+        vim.notify(
+          "lineage.nvim: " .. (req_err.message or "tree slice failed"),
+          vim.log.levels.ERROR
+        )
         return
       end
       state.expanded_children = {}

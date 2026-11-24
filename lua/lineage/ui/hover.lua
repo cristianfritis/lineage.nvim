@@ -79,8 +79,10 @@ local function render_card(hover_id)
     local verdict = card.verdict_line
       or (card.symbol .. ": " .. (card.status_badge or "Unverified"))
     if use_unicode then
-      verdict = highlights.badge(card.status_badge or "", true)
-        .. verdict:sub(#(card.symbol .. ": " .. (card.status_badge or "")) + 1)
+      local prefix = (card.symbol or "") .. ": "
+      verdict = prefix
+        .. highlights.badge(card.status_badge or "", true)
+        .. verdict:sub(#(prefix .. (card.status_badge or "")) + 1)
     end
     table.insert(lines, verdict)
 
@@ -123,18 +125,24 @@ local function render_card(hover_id)
   active.line_to_item = line_to_item
   active.index_to_item = index_to_item
 
+  local safe_lines = {}
+  for _, l in ipairs(lines) do
+    local s = tostring(l):gsub("[\r\n]+", " ")
+    table.insert(safe_lines, s)
+  end
+
   vim.bo[active.bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(active.bufnr, 0, -1, false, lines)
+  vim.api.nvim_buf_set_lines(active.bufnr, 0, -1, false, safe_lines)
   vim.bo[active.bufnr].modifiable = false
 
   local max_w = (opts.hover and opts.hover.max_width) or 80
   local max_h = (opts.hover and opts.hover.max_height) or 24
   local width = 20
-  for _, l in ipairs(lines) do
+  for _, l in ipairs(safe_lines) do
     width = math.max(width, #l + 2)
   end
   width = math.min(width, max_w)
-  local height = math.min(#lines, max_h)
+  local height = math.min(#safe_lines, max_h)
 
   -- Resize without flipping anchor across the cursor line
   pcall(vim.api.nvim_win_set_config, active.winid, {
@@ -200,8 +208,10 @@ local function bind_hover_keymaps(bufnr, hover_id)
     local origin_win = active.origin_win
     local origin_pos = active.origin_pos
     close_hover(true)
-    local bufnr = origin_win and vim.api.nvim_win_is_valid(origin_win)
-      and vim.api.nvim_win_get_buf(origin_win) or vim.api.nvim_get_current_buf()
+    local bufnr = origin_win
+        and vim.api.nvim_win_is_valid(origin_win)
+        and vim.api.nvim_win_get_buf(origin_win)
+      or vim.api.nvim_get_current_buf()
     require("lineage.ui.focus").focus({ bufnr = bufnr, position = origin_pos })
   end, map_opts)
 
@@ -212,8 +222,10 @@ local function bind_hover_keymaps(bufnr, hover_id)
     local origin_win = active.origin_win
     local origin_pos = active.origin_pos
     close_hover(true)
-    local bufnr = origin_win and vim.api.nvim_win_is_valid(origin_win)
-      and vim.api.nvim_win_get_buf(origin_win) or vim.api.nvim_get_current_buf()
+    local bufnr = origin_win
+        and vim.api.nvim_win_is_valid(origin_win)
+        and vim.api.nvim_win_get_buf(origin_win)
+      or vim.api.nvim_get_current_buf()
     require("lineage.ui.focus").pin({ bufnr = bufnr, position = origin_pos })
   end, map_opts)
 
@@ -347,9 +359,14 @@ function M.apply_delta(envelope, hover_id)
   end
 
   active.card.phase2_items = merged_p2
+  active.card.status_badge = new_card.status_badge or active.card.status_badge
+  if new_card.is_trivial_peek ~= nil then
+    active.card.is_trivial_peek = new_card.is_trivial_peek
+  end
   active.card.unknown_boundaries = new_card.unknown_boundaries or active.card.unknown_boundaries
   active.card.unverified_count = new_card.unverified_count or active.card.unverified_count
   active.card.verdict_line = new_card.verdict_line or active.card.verdict_line
+  client.clear_delta(active.query_id)
   render_card(hover_id)
 end
 
@@ -366,7 +383,7 @@ function M.open()
   end
 
   active.hover_id = active.hover_id + 1
-  active.query_id = active.query_id + 1
+  active.query_id = client.next_query_id()
   active.origin_win = origin_win
   active.origin_pos = origin_pos
 
@@ -388,7 +405,9 @@ function M.open()
 
     local clients = lsp_compat.get_clients(origin_buf)
     local lsp_attached = #clients > 0
-    local primary_client = clients[1]
+    local primary_client = lsp_compat.pick_client(origin_buf, "textDocument/definition")
+      or clients[1]
+    local cfg = config.get()
 
     client.on_delta(query_id, function(delta_env)
       M.apply_delta(delta_env, hover_id)
@@ -401,16 +420,19 @@ function M.open()
       direction = "to",
       include_graph = false,
       include_snippets = true,
-      exclude_tests = config.get().exclude_tests or false,
+      exclude_tests = cfg.exclude_tests or false,
       query_id = query_id,
       lsp_attached = lsp_attached,
       lsp_client_name = primary_client and primary_client.name or nil,
+      lsp_timeout_ms = cfg.lsp and cfg.lsp.timeout_ms or 150,
       workspace_root = vim.fn.getcwd(),
     }, function(req_err, res)
       if hover_id ~= active.hover_id then
+        client.clear_delta(query_id)
         return
       end
       if req_err then
+        client.clear_delta(query_id)
         vim.notify("lineage.nvim: " .. (req_err.message or "slice failed"), vim.log.levels.ERROR)
         return
       end

@@ -22,6 +22,10 @@ vim.api.nvim_create_user_command("Lineage", function(opts)
     lineage.both()
   elseif sub == "back" then
     lineage.back()
+  elseif sub == "install!" or (sub == "install" and opts.bang) then
+    lineage.install({ force = true })
+  elseif sub == "install" then
+    lineage.install()
   elseif sub == "status" then
     lineage.status()
   elseif sub == "log" then
@@ -33,8 +37,22 @@ vim.api.nvim_create_user_command("Lineage", function(opts)
   end
 end, {
   nargs = "?",
+  bang = true,
   complete = function(arg_lead)
-    local cmds = { "hover", "focus", "pin", "clear", "to", "from", "both", "back", "status", "log", "debug-dump" }
+    local cmds = {
+      "hover",
+      "focus",
+      "pin",
+      "clear",
+      "to",
+      "from",
+      "both",
+      "back",
+      "install",
+      "status",
+      "log",
+      "debug-dump",
+    }
     return vim.tbl_filter(function(c)
       return vim.startswith(c, arg_lead)
     end, cmds)

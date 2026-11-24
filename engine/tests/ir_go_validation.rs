@@ -155,7 +155,8 @@ fn test_go_zero_value_and_defer_named_return_downgrade() {
     assert!(!zero_int.is_maybe_absent());
 
     // Named return mutated inside `defer` downgrades to Unknown (never fabricated as Absent)
-    let defer_mutated = AbsenceValue::present().join(AbsenceValue::unknown(UnknownReason::DynamicDispatch));
+    let defer_mutated =
+        AbsenceValue::present().join(AbsenceValue::unknown(UnknownReason::DynamicDispatch));
     assert!(defer_mutated.has_unknown());
     assert!(!defer_mutated.is_maybe_absent());
 }

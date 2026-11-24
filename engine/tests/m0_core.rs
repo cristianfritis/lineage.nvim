@@ -354,17 +354,20 @@ fn test_fixture_lsp_ewma_and_circuit_breaker() {
             offset_encoding: OffsetEncoding::Utf16,
             kind: LspResolveKind::Definition,
         }],
+        circuit_open_clients: Vec::new(),
+        max_timeout_ms: None,
     };
 
+    let ctx = lineage_engine::resolver::ResolveContext::default();
     // 3 timeouts trip the circuit
     for _ in 0..3 {
-        let r = provider.resolve_batch(make_batch(), t0);
+        let r = provider.resolve_batch(make_batch(), &ctx, t0);
         assert!(r.results[0].timed_out);
     }
     assert_eq!(provider.ewma.check_circuit(&key, t0), CircuitState::Open);
 
     // Immediate call is short-circuited
-    let r_open = provider.resolve_batch(make_batch(), t0);
+    let r_open = provider.resolve_batch(make_batch(), &ctx, t0);
     assert!(r_open.results[0].circuit_open);
 
     // After 31s -> HalfOpen -> 20ms reply -> Closed
@@ -373,7 +376,7 @@ fn test_fixture_lsp_ewma_and_circuit_breaker() {
         provider.ewma.check_circuit(&key, t1),
         CircuitState::HalfOpen
     );
-    let r_rec = provider.resolve_batch(make_batch(), t1);
+    let r_rec = provider.resolve_batch(make_batch(), &ctx, t1);
     assert!(!r_rec.results[0].timed_out);
     assert!(!r_rec.results[0].circuit_open);
     assert_eq!(r_rec.results[0].locations.len(), 1);
@@ -445,6 +448,7 @@ fn test_transport_initialize_and_dirty_sync() {
                 lsp_attached: false,
                 lsp_client_name: None,
                 workspace_root: None,
+                lsp_timeout_ms: None,
             },
             "tr-test",
             &AtomicBool::new(false),

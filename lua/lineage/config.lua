@@ -2,7 +2,8 @@ local M = {}
 
 M.defaults = {
   binary_path = nil,
-  version = "0.1.0",
+  version = nil,
+  build_from_source = false,
   hover = {
     enter_on_open = true,
     border = "rounded",

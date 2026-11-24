@@ -151,6 +151,57 @@ impl FunctionIr {
     }
 }
 
+/// Compute 1-hop parameter indices that flow directly to any return value.
+pub fn compute_param_flow_to_return(insts: &[SsiInst], returns: &[ValueId]) -> Vec<usize> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    let mut params = Vec::new();
+
+    for &ret in returns {
+        if visited.insert(ret) {
+            queue.push_back(ret);
+        }
+    }
+
+    while let Some(vid) = queue.pop_front() {
+        let Some(inst) = insts.get(vid.0 as usize) else {
+            continue;
+        };
+        match &inst.op {
+            SsiOp::Param { index, .. } => {
+                if !params.contains(index) {
+                    params.push(*index);
+                }
+            }
+            SsiOp::Assign { src } | SsiOp::Pi { src, .. } => {
+                if visited.insert(*src) {
+                    queue.push_back(*src);
+                }
+            }
+            SsiOp::Phi { incoming } => {
+                for &(_b, src) in incoming {
+                    if visited.insert(src) {
+                        queue.push_back(src);
+                    }
+                }
+            }
+            SsiOp::ProjectField { base, .. }
+            | SsiOp::ProjectIndex { base, .. }
+            | SsiOp::UnwrapVariant { base, .. } => {
+                if visited.insert(*base) {
+                    queue.push_back(*base);
+                }
+            }
+            SsiOp::Const { .. } | SsiOp::Call { .. } | SsiOp::UnknownOp { .. } => {}
+        }
+    }
+
+    params.sort_unstable();
+    params
+}
+
 #[derive(Debug, Clone)]
 pub struct ImportSpec {
     pub local_name: String,

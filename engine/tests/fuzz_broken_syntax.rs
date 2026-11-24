@@ -58,6 +58,7 @@ fn test_fuzz_truncated_and_mutated_typescript_never_panics() {
                     lsp_attached: false,
                     lsp_client_name: None,
                     workspace_root: None,
+                    lsp_timeout_ms: None,
                 },
                 "fuzz",
                 &AtomicBool::new(false),
@@ -99,6 +100,7 @@ fn test_fuzz_truncated_and_mutated_typescript_never_panics() {
                     lsp_attached: false,
                     lsp_client_name: None,
                     workspace_root: None,
+                    lsp_timeout_ms: None,
                 },
                 "fuzz-mut",
                 &AtomicBool::new(false),
@@ -114,10 +116,8 @@ fn test_fuzz_truncated_and_mutated_python_and_rust_never_panics() {
     let cache = Arc::new(FileIrCache::new(128 * 1024 * 1024));
     let dirty = Arc::new(DirtyBufferOverlay::new());
     let resolver = Arc::new(NullLspProvider);
-    let adapters: Vec<Arc<dyn LanguageAdapter>> = vec![
-        Arc::new(PythonAdapter::new()),
-        Arc::new(RustAdapter::new()),
-    ];
+    let adapters: Vec<Arc<dyn LanguageAdapter>> =
+        vec![Arc::new(PythonAdapter::new()), Arc::new(RustAdapter::new())];
     let engine = SlicerEngine::new(cache, dirty, resolver, adapters);
 
     let py_seed = r#"
@@ -152,6 +152,7 @@ def process(user, flag):
                     lsp_attached: false,
                     lsp_client_name: None,
                     workspace_root: None,
+                    lsp_timeout_ms: None,
                 },
                 "fuzz-py",
                 &AtomicBool::new(false),
@@ -195,6 +196,7 @@ fn process(opt: Option<i32>) -> i32 {
                     lsp_attached: false,
                     lsp_client_name: None,
                     workspace_root: None,
+                    lsp_timeout_ms: None,
                 },
                 "fuzz-rs",
                 &AtomicBool::new(false),

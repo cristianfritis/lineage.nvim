@@ -90,4 +90,11 @@ function M.debug_dump()
   require("lineage.debug").debug_dump()
 end
 
+function M.install(opts)
+  if not initialized then
+    M.setup()
+  end
+  return require("lineage.install").install(opts)
+end
+
 return M

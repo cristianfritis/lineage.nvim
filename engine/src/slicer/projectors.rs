@@ -35,7 +35,7 @@ pub fn project_hover_card(
         }
     } else if root_absence.is_present_only() {
         "NonNull".to_string()
-    } else if is_partial {
+    } else if is_partial || root_absence == AbsenceValue::bottom() || root_absence.has_unknown() {
         "Unverified".to_string()
     } else {
         "NonNull".to_string()
@@ -123,10 +123,13 @@ pub fn project_focus_spans(graph: &SliceGraph, files: &[FileEntry]) -> Vec<Focus
     let mut by_line: HashMap<(u32, u32), (u8, FocusSpan)> = HashMap::new();
 
     for node in &graph.nodes {
-        let uri = file_map.get(&node.file_id).copied().unwrap_or("").to_string();
-        let is_absent =
-            node.absence.maybe_null || node.absence.maybe_undefined || !node.absence.present;
-        let is_unknown = !node.absence.unknown_reasons.is_empty();
+        let uri = file_map
+            .get(&node.file_id)
+            .copied()
+            .unwrap_or("")
+            .to_string();
+        let is_absent = node.absence.maybe_null || node.absence.maybe_undefined;
+        let is_unknown = !node.absence.unknown_reasons.is_empty() || !node.absence.present;
         let (severity, badge, highlight) = if is_absent {
             (2u8, "[NULL]".to_string(), "LineageStateAbsent".to_string())
         } else if is_unknown {
@@ -202,10 +205,13 @@ pub fn project_tree_rows(
         let Some(node) = node_map.get(node_id).copied() else {
             return;
         };
-        let uri = file_map.get(&node.file_id).copied().unwrap_or("").to_string();
-        let is_absent =
-            node.absence.maybe_null || node.absence.maybe_undefined || !node.absence.present;
-        let is_unknown = !node.absence.unknown_reasons.is_empty();
+        let uri = file_map
+            .get(&node.file_id)
+            .copied()
+            .unwrap_or("")
+            .to_string();
+        let is_absent = node.absence.maybe_null || node.absence.maybe_undefined;
+        let is_unknown = !node.absence.unknown_reasons.is_empty() || !node.absence.present;
         let state_badge = if is_absent {
             "[NULL]"
         } else if is_unknown {
@@ -231,7 +237,10 @@ pub fn project_tree_rows(
             None
         };
 
-        let outgoing = adj.get(node.id.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+        let outgoing = adj
+            .get(node.id.as_str())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let has_children = !is_cycle && !outgoing.is_empty();
 
         rows.push(TreeRow {
@@ -292,4 +301,153 @@ pub fn project_tree_rows(
     }
 
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::schema::{
+        AbsenceSummary, CanonicalPos, FlowNode, SliceDirection, SliceParams, UnknownReason,
+    };
+
+    #[test]
+    fn bottom_and_unknown_project_to_unverified_and_question_mark() {
+        let files = vec![FileEntry {
+            file_id: 0,
+            uri: "file:///a.ts".to_string(),
+        }];
+        let card = project_hover_card(
+            "x",
+            AbsenceValue::bottom(),
+            &files,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            &[],
+        );
+        assert_eq!(card.status_badge, "Unverified");
+
+        let range = CanonicalRange {
+            start: CanonicalPos { line: 0, col: 0 },
+            end: CanonicalPos { line: 0, col: 5 },
+        };
+        let graph = SliceGraph {
+            nodes: vec![
+                FlowNode {
+                    id: "n0".to_string(),
+                    kind: NodeKind::SourceNode,
+                    file_id: 0,
+                    range,
+                    label: "unk".to_string(),
+                    snippet: None,
+                    absence: AbsenceSummary {
+                        present: false,
+                        maybe_null: false,
+                        maybe_undefined: false,
+                        unknown_reasons: vec![UnknownReason::ExternalUntyped],
+                    },
+                    provenance: "local_ssi".to_string(),
+                },
+                FlowNode {
+                    id: "n1".to_string(),
+                    kind: NodeKind::SourceNode,
+                    file_id: 0,
+                    range: CanonicalRange {
+                        start: CanonicalPos { line: 1, col: 0 },
+                        end: CanonicalPos { line: 1, col: 5 },
+                    },
+                    label: "bot".to_string(),
+                    snippet: None,
+                    absence: AbsenceSummary {
+                        present: false,
+                        maybe_null: false,
+                        maybe_undefined: false,
+                        unknown_reasons: vec![],
+                    },
+                    provenance: "local_ssi".to_string(),
+                },
+            ],
+            edges: vec![],
+        };
+        let spans = project_focus_spans(&graph, &files);
+        assert_eq!(spans[0].badge, "[?]");
+        assert_eq!(spans[0].highlight, "LineageStateUnknown");
+        assert_eq!(spans[1].badge, "[?]");
+        assert_eq!(spans[1].highlight, "LineageStateUnknown");
+
+        let rows = project_tree_rows(&["n0".to_string(), "n1".to_string()], &graph, &files);
+        assert_eq!(rows[0].badge, "[?]");
+        assert!(!rows[0].is_absent);
+        assert_eq!(rows[1].badge, "[?]");
+        assert!(!rows[1].is_absent);
+    }
+
+    #[test]
+    fn param_flow_to_return_propagates_1hop_nullable_argument() {
+        use crate::adapters::typescript::TypeScriptAdapter;
+        use crate::cache::{DirtyBufferOverlay, FileIrCache};
+        use crate::protocol::schema::{LspPosition, OffsetEncoding};
+        use crate::resolver::NullLspProvider;
+        use crate::slicer::SlicerEngine;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let engine = SlicerEngine::new(
+            Arc::new(FileIrCache::new(1024 * 1024)),
+            Arc::new(DirtyBufferOverlay::new()),
+            Arc::new(NullLspProvider),
+            vec![Arc::new(TypeScriptAdapter::new())],
+        );
+        let code = r#"
+function passthrough(v: string) {
+    return v;
+}
+function caller(flag: boolean) {
+    let inp: string | null = "ok";
+    if (flag) {
+        inp = null;
+    }
+    const out = passthrough(inp);
+    return out;
+}
+"#;
+        let uri = "file:///test_param_flow.ts".to_string();
+        engine
+            .dirty_buffers
+            .upsert(uri.clone(), 1, code.to_string())
+            .unwrap();
+        let env = engine
+            .slice_query::<fn(crate::protocol::schema::SliceEnvelope)>(
+                &SliceParams {
+                    uri,
+                    position: LspPosition {
+                        line: 9,
+                        character: 10,
+                    },
+                    offset_encoding: OffsetEncoding::Utf8,
+                    direction: SliceDirection::To,
+                    include_graph: false,
+                    include_focus: false,
+                    include_tree: false,
+                    include_snippets: false,
+                    exclude_tests: false,
+                    query_id: Some(1),
+                    lsp_attached: false,
+                    lsp_client_name: None,
+                    workspace_root: None,
+                    lsp_timeout_ms: None,
+                },
+                "tr-pf",
+                &AtomicBool::new(false),
+                None,
+            )
+            .unwrap();
+        let badge = env.projections.hover_card.unwrap().status_badge;
+        assert!(
+            badge.starts_with("Nullable"),
+            "expected Nullable badge from 1-hop param_flow_to_return, got {badge}"
+        );
+    }
 }

@@ -8,6 +8,7 @@ local uv = vim.uv or vim.loop
 local PROTOCOL_VERSION = 1
 local MAX_RESTARTS = 3
 local STDERR_RING_MAX = 50
+local TELEMETRY_RING_MAX = 100
 
 local state = {
   handle = nil,
@@ -16,14 +17,35 @@ local state = {
   stderr = nil,
   buf = "",
   next_id = 1,
+  next_query_id = 0,
   pending = {},
+  init_waiters = {},
   delta_listeners = {},
+  inflight_telemetry = {},
+  telemetry_ring = {},
+  parse_errors = 0,
   restarts = 0,
   stderr_ring = {},
   initialized = false,
   protocol_mismatch = false,
   binary_path = nil,
 }
+
+local function push_telemetry(entry)
+  table.insert(state.telemetry_ring, entry)
+  if #state.telemetry_ring > TELEMETRY_RING_MAX then
+    table.remove(state.telemetry_ring, 1)
+  end
+end
+
+function M.next_query_id()
+  state.next_query_id = state.next_query_id + 1
+  return state.next_query_id
+end
+
+function M.get_telemetry()
+  return vim.deepcopy(state.telemetry_ring)
+end
 
 local function push_stderr(chunk)
   for line in chunk:gmatch("[^\r\n]+") do
@@ -41,37 +63,55 @@ end
 function M.find_binary(opts)
   opts = opts or config.get()
   if opts.binary_path and vim.fn.executable(opts.binary_path) == 1 then
-    return opts.binary_path
+    return opts.binary_path, "custom binary_path"
   end
 
-  local ver = opts.version or "0.1.0"
-  local data_bin = vim.fn.stdpath("data") .. "/lineage/bin/lineage-engine-v" .. ver
+  local install = require("lineage.install")
+  local pinned = install.resolve_pinned_binary(opts)
+  if pinned and pinned.path and vim.fn.executable(pinned.path) == 1 then
+    local label = pinned.is_source_build
+        and ("installed (" .. pinned.engine_tag .. ", source_build)")
+      or ("installed (" .. pinned.engine_tag .. ")")
+    return pinned.path, label
+  end
+
+  local ver = opts.version or (pinned and pinned.version) or "0.1.0"
+  local ext = (uv.os_uname().sysname == "Windows_NT") and ".exe" or ""
+  local data_bin = vim.fn.stdpath("data") .. "/lineage/bin/lineage-engine-v" .. ver .. ext
   if vim.fn.executable(data_bin) == 1 then
-    return data_bin
+    return data_bin, "installed (v" .. ver .. ")"
   end
 
   -- Local dev binary inside plugin repo
   local source_dir = debug.getinfo(1, "S").source:sub(2)
   local plugin_root = vim.fn.fnamemodify(source_dir, ":h:h:h")
-  local release_bin = plugin_root .. "/engine/target/release/lineage-engine"
+  local release_bin = plugin_root .. "/engine/target/release/lineage-engine" .. ext
   if vim.fn.executable(release_bin) == 1 then
-    return release_bin
+    return release_bin, "local dev (target/release)"
   end
-  local debug_bin = plugin_root .. "/engine/target/debug/lineage-engine"
+  local debug_bin = plugin_root .. "/engine/target/debug/lineage-engine" .. ext
   if vim.fn.executable(debug_bin) == 1 then
-    return debug_bin
+    return debug_bin, "local dev (target/debug)"
   end
 
   local path_bin = vim.fn.exepath("lineage-engine")
   if path_bin ~= "" then
-    return path_bin
+    return path_bin, "PATH"
   end
 
-  return nil
+  return nil, nil
 end
 
 function M.is_running()
   return state.handle ~= nil and not state.handle:is_closing()
+end
+
+local function drain_init_waiters(err, ok)
+  local waiters = state.init_waiters
+  state.init_waiters = {}
+  for _, cb in ipairs(waiters) do
+    pcall(cb, err, ok)
+  end
 end
 
 function M.stop()
@@ -85,6 +125,7 @@ function M.stop()
   state.stdout = nil
   state.stderr = nil
   state.initialized = false
+  drain_init_waiters("lineage-engine stopped", nil)
 end
 
 local function reject_all_pending(reason)
@@ -144,7 +185,14 @@ local function handle_message(msg)
 
   -- Reverse-RPC request from engine (e-<n>)
   if msg.id and msg.method == "lineage/lspResolveBatch" then
-    lsp_compat.resolve_batch(msg.params or {}, nil, function(res)
+    local p = msg.params or {}
+    local open_set = {}
+    if type(p.circuit_open_clients) == "table" then
+      for _, name in ipairs(p.circuit_open_clients) do
+        open_set[name] = true
+      end
+    end
+    lsp_compat.resolve_batch(p, open_set, function(res)
       send_raw({
         jsonrpc = "2.0",
         id = msg.id,
@@ -157,9 +205,20 @@ local function handle_message(msg)
   -- Server notification
   if msg.method == "lineage/sliceDelta" and msg.params then
     local qid = msg.params.query_id
+    local env = msg.params.envelope
+    if qid and env and env.stats then
+      for i = #state.telemetry_ring, 1, -1 do
+        local entry = state.telemetry_ring[i]
+        if entry.query_id == qid then
+          entry.delta_received = true
+          entry.phase2_ms = env.stats.phase2_ms
+          break
+        end
+      end
+    end
     local listener = state.delta_listeners[qid]
     if listener then
-      listener(msg.params.envelope)
+      listener(env)
     end
   end
 end
@@ -182,6 +241,8 @@ local function on_stdout_chunk(err, data)
         vim.schedule(function()
           handle_message(decoded)
         end)
+      else
+        state.parse_errors = state.parse_errors + 1
       end
     end
   end
@@ -197,10 +258,7 @@ function M.ensure_started(cb)
     return
   end
   if M.is_running() and not state.initialized then
-    -- Wait for initialize
-    table.insert(state.pending, function(err)
-      cb(err, err == nil)
-    end)
+    table.insert(state.init_waiters, cb)
     return
   end
 
@@ -230,9 +288,13 @@ function M.ensure_started(cb)
       state.initialized = false
       state.restarts = state.restarts + 1
       sync.reset()
-      reject_all_pending(
-        "lineage-engine exited (code=" .. tostring(code) .. ", signal=" .. tostring(signal) .. ")"
-      )
+      local exit_msg = "lineage-engine exited (code="
+        .. tostring(code)
+        .. ", signal="
+        .. tostring(signal)
+        .. ")"
+      reject_all_pending(exit_msg)
+      drain_init_waiters(exit_msg, nil)
     end)
   end)
 
@@ -246,6 +308,7 @@ function M.ensure_started(cb)
   state.stdout = stdout
   state.stderr = stderr
   state.buf = ""
+  table.insert(state.init_waiters, cb)
 
   stdout:read_start(on_stdout_chunk)
   stderr:read_start(function(err, data)
@@ -261,26 +324,27 @@ function M.ensure_started(cb)
     protocol_version = PROTOCOL_VERSION,
   }, function(err, res)
     if err then
+      local msg = err.message or "initialize failed"
       M.stop()
-      cb(err.message or "initialize failed", nil)
+      drain_init_waiters(msg, nil)
       return
     end
     if not res or res.protocol_version ~= PROTOCOL_VERSION then
       state.protocol_mismatch = true
       local got = res and tostring(res.protocol_version) or "nil"
-      M.stop()
       local msg = string.format(
         "lineage-engine protocol_version mismatch: expected %d, got %s. Please rebuild/upgrade lineage-engine.",
         PROTOCOL_VERSION,
         got
       )
+      M.stop()
       vim.notify(msg, vim.log.levels.ERROR)
-      cb(msg, nil)
+      drain_init_waiters(msg, nil)
       return
     end
     state.initialized = true
     state.restarts = 0
-    cb(nil, true)
+    drain_init_waiters(nil, true)
   end)
 end
 
@@ -298,7 +362,27 @@ function M.request(method, params, cb)
 
   local id = "c-" .. tostring(state.next_id)
   state.next_id = state.next_id + 1
-  state.pending[id] = cb
+  local t0 = uv.hrtime()
+  local qid = type(params) == "table" and params.query_id or nil
+
+  state.pending[id] = function(err, result)
+    if method == "lineage/slice" then
+      local rtt_ms = math.floor((uv.hrtime() - t0) / 1e6)
+      local stats = (type(result) == "table" and result.stats) or {}
+      push_telemetry({
+        query_id = qid,
+        trace_id = type(result) == "table" and result.trace_id or nil,
+        method = method,
+        phase1_ms = stats.phase1_ms,
+        phase2_ms = stats.phase2_ms,
+        rtt_ms = rtt_ms,
+        delta_received = false,
+        parse_errors = state.parse_errors,
+        restarts = state.restarts,
+      })
+    end
+    cb(err, result)
+  end
 
   local ok = send_raw({
     jsonrpc = "2.0",

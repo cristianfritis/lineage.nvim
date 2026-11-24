@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, unbounded, Sender};
 
-use crate::cache::parse_worker_cap;
+use crate::cache::{current_process_rss_bytes, parse_worker_cap};
 use crate::protocol::schema::{
     CancelRequestParams, CloseBufferParams, DebugDumpParams, EngineCapabilities, ExpandParams,
     InitializeParams, InitializeResult, LspResolveBatchParams, LspResolveBatchResult, RpcError,
@@ -15,8 +15,30 @@ use crate::protocol::schema::{
     PROTOCOL_VERSION, SCHEMA_VERSION,
 };
 use crate::resolver::ewma::EwmaTracker;
-use crate::resolver::lsp_provider::{ReverseRpcSender, StdioLspProvider};
-use crate::slicer::SlicerEngine;
+use crate::resolver::lsp_provider::{
+    NullLspProvider, ReverseRpcError, ReverseRpcSender, StdioLspProvider,
+};
+use crate::slicer::{Phase2Context, SlicerEngine};
+
+pub struct QueryCancelGuard {
+    pub query_id: u64,
+    pub state: Arc<TransportState>,
+}
+
+impl Drop for QueryCancelGuard {
+    fn drop(&mut self) {
+        self.state.finish_query(self.query_id);
+    }
+}
+
+pub struct Phase2Job {
+    pub ctx: Phase2Context,
+    pub cancel: Arc<AtomicBool>,
+    pub query_id: u64,
+    pub trace_id: String,
+    pub state: Arc<TransportState>,
+    pub _guard: QueryCancelGuard,
+}
 
 pub struct TransportState {
     pub engine: Arc<SlicerEngine>,
@@ -24,8 +46,9 @@ pub struct TransportState {
     pub out_tx: Sender<String>,
     pub next_engine_id: AtomicU64,
     pub next_trace_id: AtomicU64,
-    pub pending_reverse: Mutex<HashMap<RpcId, oneshot::Sender<RpcResponse>>>,
+    pub pending_reverse: Mutex<HashMap<RpcId, (u64, oneshot::Sender<RpcResponse>)>>,
     pub active_cancels: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    pub phase2_tx: Mutex<Option<Sender<Phase2Job>>>,
     pub shutdown_flag: AtomicBool,
 }
 
@@ -35,6 +58,15 @@ impl TransportState {
         log_path: Option<String>,
         out_tx: Sender<String>,
     ) -> Arc<Self> {
+        Self::with_phase2_tx(engine, log_path, out_tx, None)
+    }
+
+    pub fn with_phase2_tx(
+        engine: Arc<SlicerEngine>,
+        log_path: Option<String>,
+        out_tx: Sender<String>,
+        phase2_tx: Option<Sender<Phase2Job>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             engine,
             log_path,
@@ -43,8 +75,14 @@ impl TransportState {
             next_trace_id: AtomicU64::new(1),
             pending_reverse: Mutex::new(HashMap::new()),
             active_cancels: Mutex::new(HashMap::new()),
+            phase2_tx: Mutex::new(phase2_tx),
             shutdown_flag: AtomicBool::new(false),
         })
+    }
+
+    pub fn close_phase2_pool(&self) {
+        let mut guard = self.phase2_tx.lock().expect("phase2_tx lock");
+        *guard = None;
     }
 
     pub fn send_json<T: serde::Serialize>(&self, msg: &T) {
@@ -56,18 +94,23 @@ impl TransportState {
     pub fn make_reverse_rpc_sender(self: &Arc<Self>) -> ReverseRpcSender {
         let state = Arc::clone(self);
         Arc::new(move |params: LspResolveBatchParams| {
+            if state.shutdown_flag.load(Ordering::Relaxed) {
+                return Err(ReverseRpcError::Cancelled);
+            }
             let n = state.next_engine_id.fetch_add(1, Ordering::Relaxed);
             let id = RpcId::Str(format!("e-{n}"));
             let (tx, rx) = oneshot::channel();
             {
                 let mut map = state.pending_reverse.lock().expect("pending_reverse lock");
-                map.insert(id.clone(), tx);
+                map.insert(id.clone(), (params.query_id, tx));
             }
+            let payload =
+                serde_json::to_value(&params).map_err(|e| ReverseRpcError::Other(e.to_string()))?;
             let req = RpcRequest {
                 jsonrpc: "2.0".to_string(),
                 id: Some(id.clone()),
                 method: "lineage/lspResolveBatch".to_string(),
-                params: serde_json::to_value(&params).map_err(|e| e.to_string())?,
+                params: payload,
             };
             state.send_json(&req);
 
@@ -75,18 +118,21 @@ impl TransportState {
             match rx.recv_timeout(Duration::from_millis(wait_ms)) {
                 Ok(resp) => {
                     if let Some(err) = resp.error {
-                        Err(err.message)
+                        Err(ReverseRpcError::Other(err.message))
                     } else if let Some(res) = resp.result {
                         serde_json::from_value::<LspResolveBatchResult>(res)
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| ReverseRpcError::Other(e.to_string()))
                     } else {
-                        Err("Empty reverse-RPC response".to_string())
+                        Err(ReverseRpcError::Other(
+                            "Empty reverse-RPC response".to_string(),
+                        ))
                     }
                 }
-                Err(_) => {
+                Err(oneshot::RecvTimeoutError::Disconnected) => Err(ReverseRpcError::Cancelled),
+                Err(oneshot::RecvTimeoutError::Timeout) => {
                     let mut map = state.pending_reverse.lock().expect("pending_reverse lock");
                     map.remove(&id);
-                    Err("Reverse-RPC timeout".to_string())
+                    Err(ReverseRpcError::Timeout)
                 }
             }
         })
@@ -100,10 +146,25 @@ impl TransportState {
     }
 
     pub fn cancel_query(&self, query_id: u64) {
-        let map = self.active_cancels.lock().expect("cancels lock");
-        if let Some(flag) = map.get(&query_id) {
-            flag.store(true, Ordering::Relaxed);
+        {
+            let map = self.active_cancels.lock().expect("cancels lock");
+            if let Some(flag) = map.get(&query_id) {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
+        let mut pending = self.pending_reverse.lock().expect("pending_reverse lock");
+        pending.retain(|_, (qid, _)| *qid != query_id);
+    }
+
+    pub fn cancel_all_and_drain(&self) {
+        {
+            let map = self.active_cancels.lock().expect("cancels lock");
+            for flag in map.values() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        let mut pending = self.pending_reverse.lock().expect("pending_reverse lock");
+        pending.clear();
     }
 
     pub fn finish_query(&self, query_id: u64) {
@@ -119,7 +180,8 @@ impl TransportState {
 
 pub fn serve_stdio(engine: Arc<SlicerEngine>, log_path: Option<String>) {
     let (out_tx, out_rx) = unbounded::<String>();
-    let state = TransportState::new(engine.clone(), log_path, out_tx);
+    let (phase2_tx, phase2_rx) = bounded::<Phase2Job>(64);
+    let state = TransportState::with_phase2_tx(engine.clone(), log_path, out_tx, Some(phase2_tx));
     let reverse_sender = state.make_reverse_rpc_sender();
     let ewma = Arc::new(EwmaTracker::new());
     let workspace_root = std::env::current_dir()
@@ -146,7 +208,35 @@ pub fn serve_stdio(engine: Arc<SlicerEngine>, log_path: Option<String>) {
         }
     });
 
-    // Worker pool
+    // Dedicated bounded Phase 2 worker pool (2-4 threads)
+    let phase2_count = parse_worker_cap().clamp(2, 4);
+    let mut phase2_workers = Vec::with_capacity(phase2_count);
+    for _ in 0..phase2_count {
+        let rx = phase2_rx.clone();
+        phase2_workers.push(thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                if !job.cancel.load(Ordering::Relaxed)
+                    && !job.state.shutdown_flag.load(Ordering::Relaxed)
+                {
+                    if let Some(delta_env) = job.state.engine.execute_phase2(job.ctx, &job.cancel) {
+                        if !job.cancel.load(Ordering::Relaxed) {
+                            let notif = RpcNotification::new(
+                                "lineage/sliceDelta",
+                                serde_json::json!({
+                                    "query_id": job.query_id,
+                                    "trace_id": job.trace_id,
+                                    "envelope": delta_env,
+                                }),
+                            );
+                            job.state.send_json(&notif);
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // Phase 1 worker pool
     let worker_count = parse_worker_cap();
     let (job_tx, job_rx) = bounded::<RpcRequest>(64);
     let mut workers = Vec::with_capacity(worker_count);
@@ -171,15 +261,19 @@ pub fn serve_stdio(engine: Arc<SlicerEngine>, log_path: Option<String>) {
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
+        let val = match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "ignoring malformed JSON-RPC frame");
+                continue;
+            }
         };
 
         // Check if this is a response to an engine reverse-RPC ("e-<n>")
         if val.get("method").is_none() && val.get("id").is_some() {
             if let Ok(resp) = serde_json::from_value::<RpcResponse>(val) {
                 let mut pending = state.pending_reverse.lock().expect("pending_reverse lock");
-                if let Some(tx) = pending.remove(&resp.id) {
+                if let Some((_qid, tx)) = pending.remove(&resp.id) {
                     let _ = tx.send(resp);
                 }
             }
@@ -197,6 +291,7 @@ pub fn serve_stdio(engine: Arc<SlicerEngine>, log_path: Option<String>) {
             }
             if req.method == "shutdown" {
                 state.shutdown_flag.store(true, Ordering::Relaxed);
+                state.cancel_all_and_drain();
                 if let Some(id) = req.id {
                     state.send_json(&RpcResponse::ok(id, serde_json::json!(null)));
                 }
@@ -210,6 +305,11 @@ pub fn serve_stdio(engine: Arc<SlicerEngine>, log_path: Option<String>) {
     for w in workers {
         let _ = w.join();
     }
+    state.close_phase2_pool();
+    for w in phase2_workers {
+        let _ = w.join();
+    }
+    state.engine.set_resolver(Arc::new(NullLspProvider));
     drop(state);
     let _ = writer_handle.join();
 }
@@ -279,26 +379,35 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
             Ok(p) => {
                 let qid = p.query_id.unwrap_or(1);
                 let cancel = state.register_cancel(qid);
-                let st_delta = Arc::clone(state);
-                let trace_clone = trace_id.clone();
-                let res = state.engine.slice_query(
-                    &p,
-                    &trace_id,
-                    &cancel,
-                    Some(move |delta_env| {
-                        let notif = RpcNotification::new(
-                            "lineage/sliceDelta",
-                            serde_json::json!({
-                                "query_id": qid,
-                                "trace_id": trace_clone,
-                                "envelope": delta_env,
-                            }),
-                        );
-                        st_delta.send_json(&notif);
-                    }),
-                );
-                state.finish_query(qid);
-                res.map(|env| serde_json::to_value(env).unwrap())
+                match state.engine.slice_phase1(&p, &trace_id, &cancel) {
+                    Ok((env, phase2_opt)) => {
+                        state.send_json(&RpcResponse::ok(id, serde_json::to_value(&env).unwrap()));
+                        if let Some(ctx) = phase2_opt {
+                            let job = Phase2Job {
+                                ctx,
+                                cancel,
+                                query_id: qid,
+                                trace_id: trace_id.clone(),
+                                state: Arc::clone(state),
+                                _guard: QueryCancelGuard {
+                                    query_id: qid,
+                                    state: Arc::clone(state),
+                                },
+                            };
+                            let guard = state.phase2_tx.lock().expect("phase2_tx lock");
+                            if let Some(ref tx) = *guard {
+                                let _ = tx.try_send(job);
+                            }
+                        } else {
+                            state.finish_query(qid);
+                        }
+                        return;
+                    }
+                    Err(err) => {
+                        state.finish_query(qid);
+                        Err(err)
+                    }
+                }
             }
             Err(e) => Err(RpcError::invalid_params(e.to_string())),
         },
@@ -326,6 +435,7 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
                 loaded_grammars,
                 ewma_clients,
                 log_path: state.log_path.clone(),
+                rss_bytes: current_process_rss_bytes(),
             };
             Ok(serde_json::to_value(status).unwrap())
         }
@@ -341,7 +451,7 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
                 let cancel = Arc::new(AtomicBool::new(false));
                 state
                     .engine
-                    .expand_node(&p, &cancel)
+                    .expand_node(&p, &trace_id, &cancel)
                     .map(|res| serde_json::to_value(res).unwrap())
             }
             Err(e) => Err(RpcError::invalid_params(e.to_string())),

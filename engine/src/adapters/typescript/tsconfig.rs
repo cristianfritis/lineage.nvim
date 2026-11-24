@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use moka::sync::Cache;
 
 use crate::adapters::ImportResolution;
 
@@ -17,33 +18,36 @@ pub struct TsConfig {
     pub paths: HashMap<String, Vec<String>>,
 }
 
-#[derive(Default)]
 pub struct TsConfigCache {
-    by_dir: Mutex<HashMap<PathBuf, Option<TsConfig>>>,
+    by_dir: Cache<PathBuf, Option<TsConfig>>,
+}
+
+impl Default for TsConfigCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TsConfigCache {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            by_dir: Cache::new(64),
+        }
     }
 
     pub fn find_for_file(&self, file: &Path, workspace_root: Option<&Path>) -> Option<TsConfig> {
         let start_dir = file.parent()?;
         let mut cur = Some(start_dir);
         while let Some(dir) = cur {
-            {
-                let cache = self.by_dir.lock().expect("tsconfig cache lock");
-                if let Some(cached) = cache.get(dir) {
-                    if cached.is_some() {
-                        return cached.clone();
-                    }
+            if let Some(cached) = self.by_dir.get(dir) {
+                if cached.is_some() {
+                    return cached;
                 }
             }
             let candidate = dir.join("tsconfig.json");
             if candidate.is_file() {
                 let parsed = parse_tsconfig(&candidate, workspace_root);
-                let mut cache = self.by_dir.lock().expect("tsconfig cache lock");
-                cache.insert(dir.to_path_buf(), parsed.clone());
+                self.by_dir.insert(dir.to_path_buf(), parsed.clone());
                 return parsed;
             }
             if let Some(root) = workspace_root {

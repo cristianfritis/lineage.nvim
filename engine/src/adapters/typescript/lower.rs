@@ -1202,7 +1202,8 @@ impl<'a> LowerCtx<'a> {
 
     fn finish(mut self, skeleton: &FunctionSkeleton) -> FunctionIr {
         self.span_index.sort_by_key(|(r, _)| (r.start, r.end));
-        let param_flow_to_return = Vec::new();
+        let param_flow_to_return =
+            crate::ir::compute_param_flow_to_return(&self.insts, &self.returns);
         FunctionIr {
             symbol_id: skeleton.symbol_id.clone(),
             name: skeleton.name.clone(),
@@ -1214,11 +1215,7 @@ impl<'a> LowerCtx<'a> {
             danger_sinks: self.danger_sinks,
             span_index: self.span_index,
             local_summary: FnSummary {
-                return_absence: if self.return_absence == AbsenceValue::bottom() {
-                    AbsenceValue::present()
-                } else {
-                    self.return_absence
-                },
+                return_absence: self.return_absence,
                 param_flow_to_return,
                 symbolic_callees: self.symbolic_callees,
             },

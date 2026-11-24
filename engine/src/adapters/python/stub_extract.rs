@@ -20,9 +20,7 @@ fn find_pyi_symbol_return(node: Node<'_>, src: &[u8], symbol: &str) -> Option<Ab
         if let Some(name_node) = node.child_by_field_name("name") {
             if name_node.utf8_text(src).ok() == Some(symbol) {
                 if let Some(ret_node) = node.child_by_field_name("return_type") {
-                    return Some(classify_py_type_text(
-                        ret_node.utf8_text(src).unwrap_or(""),
-                    ));
+                    return Some(classify_py_type_text(ret_node.utf8_text(src).unwrap_or("")));
                 }
             }
         }
@@ -53,7 +51,10 @@ pub fn classify_py_type_text(raw: &str) -> AbsenceValue {
     }
     if trimmed.starts_with("Union[") && trimmed.ends_with(']') {
         let inner = &trimmed["Union[".len()..trimmed.len() - 1];
-        if split_top_level(inner, ',').iter().any(|p| p.trim() == "None") {
+        if split_top_level(inner, ',')
+            .iter()
+            .any(|p| p.trim() == "None")
+        {
             return AbsenceValue {
                 known_states: STATE_PRESENT | STATE_NULL,
                 unknown_reasons: 0,

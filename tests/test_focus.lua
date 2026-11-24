@@ -59,7 +59,10 @@ assert(focus.statusline():find("%[stale%]") ~= nil, "Expected [stale] in statusl
 st.pinned = true
 local buf2 = vim.api.nvim_create_buf(false, true)
 vim.api.nvim_win_set_buf(0, buf2)
-assert(focus.get_state().active == true and focus.get_state().pinned == true, "Pin should remain active across buffer switch")
+assert(
+  focus.get_state().active == true and focus.get_state().pinned == true,
+  "Pin should remain active across buffer switch"
+)
 
 -- Verify clear removes all extmarks and resets state
 focus.clear()

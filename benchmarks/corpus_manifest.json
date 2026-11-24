@@ -1,0 +1,38 @@
+{
+  "repos": [
+    {
+      "name": "zod",
+      "language": "typescript",
+      "url": "https://github.com/colinhacks/zod.git",
+      "commit": "d40c329910436e528d3c26cb1b9179e05abebf05",
+      "subdirs": ["packages/zod/src", "src"]
+    },
+    {
+      "name": "preact",
+      "language": "typescript",
+      "url": "https://github.com/preactjs/preact.git",
+      "commit": "1fbc07f67bd841315332cac73de8ce1ae3e8b7b5",
+      "subdirs": ["src"]
+    },
+    {
+      "name": "fastapi",
+      "language": "python",
+      "url": "https://github.com/fastapi/fastapi.git",
+      "commit": "05e6df7e906c3decba377c37548019973f40bf15",
+      "subdirs": ["fastapi"]
+    },
+    {
+      "name": "ripgrep",
+      "language": "rust",
+      "url": "https://github.com/BurntSushi/ripgrep.git",
+      "commit": "4a51093f78bfbef86d89275f4916fd6b6039fe9e",
+      "subdirs": ["crates"]
+    },
+    {
+      "name": "lineage-engine",
+      "language": "rust",
+      "local_path": "engine",
+      "subdirs": ["src"]
+    }
+  ]
+}

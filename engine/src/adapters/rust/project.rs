@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
+use moka::sync::Cache;
 
 use crate::adapters::typescript::tsconfig::safe_join;
 use crate::adapters::ImportResolution;
@@ -14,14 +15,21 @@ pub struct CargoWorkspaceMeta {
     pub member_crates: HashMap<String, PathBuf>,
 }
 
-#[derive(Default)]
 pub struct CargoWorkspaceCache {
-    by_dir: Mutex<HashMap<PathBuf, Option<CargoWorkspaceMeta>>>,
+    by_dir: Cache<PathBuf, Option<CargoWorkspaceMeta>>,
+}
+
+impl Default for CargoWorkspaceCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CargoWorkspaceCache {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            by_dir: Cache::new(64),
+        }
     }
 
     pub fn find_for_file(
@@ -34,23 +42,19 @@ impl CargoWorkspaceCache {
         let mut first_pkg: Option<CargoWorkspaceMeta> = None;
 
         while let Some(dir) = cur {
-            {
-                let cache = self.by_dir.lock().expect("cargo cache lock");
-                if let Some(Some(meta)) = cache.get(dir) {
-                    if meta.is_workspace {
-                        return Some(meta.clone());
-                    }
-                    if first_pkg.is_none() {
-                        first_pkg = Some(meta.clone());
-                    }
+            if let Some(Some(meta)) = self.by_dir.get(dir) {
+                if meta.is_workspace {
+                    return Some(meta);
+                }
+                if first_pkg.is_none() {
+                    first_pkg = Some(meta);
                 }
             }
 
             let cargo_toml = dir.join("Cargo.toml");
             if cargo_toml.is_file() {
                 let meta = parse_cargo_toml(&cargo_toml, dir);
-                let mut cache = self.by_dir.lock().expect("cargo cache lock");
-                cache.insert(dir.to_path_buf(), meta.clone());
+                self.by_dir.insert(dir.to_path_buf(), meta.clone());
                 if let Some(m) = meta {
                     if m.is_workspace {
                         return Some(m);

@@ -81,6 +81,11 @@ impl AbsenceValue {
         self
     }
 
+    pub fn without_unknown(mut self, reason: UnknownReason) -> Self {
+        self.unknown_reasons &= !reason_bit(reason);
+        self
+    }
+
     pub fn join(self, other: Self) -> Self {
         Self {
             known_states: self.known_states | other.known_states,
@@ -133,7 +138,7 @@ impl AbsenceValue {
     }
 }
 
-const ALL_REASONS: [UnknownReason; 13] = [
+const ALL_REASONS: [UnknownReason; 14] = [
     UnknownReason::ExternalUntyped,
     UnknownReason::DynamicDispatch,
     UnknownReason::LspTimeout,
@@ -147,6 +152,7 @@ const ALL_REASONS: [UnknownReason; 13] = [
     UnknownReason::TreeSitterErrorNode,
     UnknownReason::PolymorphicCap,
     UnknownReason::MaxDepth,
+    UnknownReason::ExternalUninstalled,
 ];
 
 pub const fn reason_bit(reason: UnknownReason) -> u32 {
@@ -164,6 +170,7 @@ pub const fn reason_bit(reason: UnknownReason) -> u32 {
         UnknownReason::TreeSitterErrorNode => 10,
         UnknownReason::PolymorphicCap => 11,
         UnknownReason::MaxDepth => 12,
+        UnknownReason::ExternalUninstalled => 13,
     };
     1u32 << idx
 }

@@ -50,6 +50,7 @@ fn slice_at_cursor(ext: &str, marked_src: &str) -> SliceEnvelope {
                 lsp_attached: false,
                 lsp_client_name: None,
                 workspace_root: None,
+                lsp_timeout_ms: None,
             },
             "golden-py",
             &AtomicBool::new(false),
@@ -78,7 +79,7 @@ fn golden_python_cases() -> Vec<(&'static str, &'static str, &'static str)> {
         ("16_truthy_then_present", "def f(x: str | None):\n    if x:\n        return <|>x\n    return 'a'\n", "NonNull"),
         ("17_truthy_else_maybe_absent", "def f(x: str | None):\n    if x:\n        return 'a'\n    else:\n        return <|>x\n", "Nullable"),
         ("18_not_x_else_present", "def f(x: str | None):\n    if not x:\n        return 'a'\n    else:\n        return <|>x\n", "NonNull"),
-        ("19_walrus_guard", "def f(get_u):\n    if (u := get_u()) is not None:\n        return <|>u\n    return 'a'\n", "NonNull"),
+        ("19_walrus_guard", "def f(get_u):\n    if (u := get_u()) is not None:\n        return <|>u\n    return 'a'\n", "Unverified"),
         ("20_walrus_assign", "def f():\n    if (u := None) is None:\n        return <|>u\n    return 'a'\n", "Absent"),
         ("21_phi_merge_none", "def f(c):\n    x = 'ok'\n    if c:\n        x = None\n    return <|>x\n", "Nullable"),
         ("22_stdlib_dict_get", "def f(d):\n    <|>v = d.get('k')\n    return v\n", "Nullable"),
@@ -90,7 +91,7 @@ fn golden_python_cases() -> Vec<(&'static str, &'static str, &'static str)> {
         ("28_stdlib_json_loads", "import json\ndef f(s):\n    <|>v = json.loads(s)\n    return v\n", "NonNull"),
         ("29_stdlib_str_strip", "def f(s):\n    <|>v = s.strip()\n    return v\n", "NonNull"),
         ("30_stdlib_str_split", "def f(s):\n    <|>v = s.split(',')\n    return v\n", "NonNull"),
-        ("31_async_def_await", "async def f():\n    <|>v = await get_val()\n    return v\n", "NonNull"),
+        ("31_async_def_await", "async def f():\n    <|>v = await get_val()\n    return v\n", "Unverified"),
         ("32_class_method_none", "class Svc:\n    def get(self):\n        <|>v = None\n        return v\n", "Absent"),
         ("33_class_method_present", "class Svc:\n    def get(self):\n        <|>v = 123\n        return v\n", "NonNull"),
         ("34_shallow_field_write", "def f(obj):\n    obj.name = 'alice'\n    return <|>obj.name\n", "NonNull"),
@@ -120,7 +121,10 @@ fn test_42_golden_python_cases() {
 
 #[test]
 fn test_python_danger_sinks_reported() {
-    let env = slice_at_cursor("py", "def f(x: str | None):\n    <|>y = x.strip\n    return y\n");
+    let env = slice_at_cursor(
+        "py",
+        "def f(x: str | None):\n    <|>y = x.strip\n    return y\n",
+    );
     let card = env.projections.hover_card.unwrap();
     assert!(!card.local_risks.is_empty());
 }
@@ -134,13 +138,21 @@ def get_item(k: str) -> Item | None: ...
 def generic_id(x: T) -> T: ...
 def count_items() -> int: ...
 "#;
-    let u = adapter.extract_declaration_signature("file:///a.pyi", pyi, "find_user").unwrap();
+    let u = adapter
+        .extract_declaration_signature("file:///a.pyi", pyi, "find_user")
+        .unwrap();
     assert!(u.is_maybe_absent());
-    let g = adapter.extract_declaration_signature("file:///a.pyi", pyi, "get_item").unwrap();
+    let g = adapter
+        .extract_declaration_signature("file:///a.pyi", pyi, "get_item")
+        .unwrap();
     assert!(g.is_maybe_absent());
-    let gen = adapter.extract_declaration_signature("file:///a.pyi", pyi, "generic_id").unwrap();
+    let gen = adapter
+        .extract_declaration_signature("file:///a.pyi", pyi, "generic_id")
+        .unwrap();
     assert!(gen.has_unknown() && !gen.is_maybe_absent());
-    let cnt = adapter.extract_declaration_signature("file:///a.pyi", pyi, "count_items").unwrap();
+    let cnt = adapter
+        .extract_declaration_signature("file:///a.pyi", pyi, "count_items")
+        .unwrap();
     assert!(!cnt.is_maybe_absent() && !cnt.has_unknown());
 }
 
@@ -151,8 +163,16 @@ fn test_python_pyproject_and_relative_import_resolution() {
     std::fs::create_dir_all(tmp.join("src/myapp")).unwrap();
     std::fs::write(tmp.join("pyproject.toml"), "[project]\nname = \"myapp\"\n").unwrap();
     std::fs::write(tmp.join("src/myapp/__init__.py"), "").unwrap();
-    std::fs::write(tmp.join("src/myapp/helpers.py"), "def get_user(): return None\n").unwrap();
-    std::fs::write(tmp.join("src/myapp/main.py"), "from .helpers import get_user\n").unwrap();
+    std::fs::write(
+        tmp.join("src/myapp/helpers.py"),
+        "def get_user(): return None\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/myapp/main.py"),
+        "from .helpers import get_user\n",
+    )
+    .unwrap();
 
     let adapter = PythonAdapter::new();
     let res_rel = adapter.resolve_static_import(

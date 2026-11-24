@@ -67,14 +67,14 @@ pub fn lookup_stdlib_summary(symbol: &str) -> Option<AbsenceValue> {
         _ => match tail {
             "find" | "get" | "pop" | "shift" => Some(AbsenceValue::maybe_undefined()),
             "exec" | "querySelector" => Some(AbsenceValue::maybe_null()),
-            "map" | "filter" | "reduce" | "forEach" | "some" | "every" | "includes"
-            | "indexOf" | "lastIndexOf" | "join" | "slice" | "concat" | "flat" | "flatMap"
-            | "push" | "unshift" | "splice" | "reverse" | "sort" | "keys" | "values"
-            | "entries" | "has" | "set" | "add" | "delete" | "clear" | "trim" | "trimStart"
-            | "trimEnd" | "split" | "replace" | "replaceAll" | "startsWith" | "endsWith"
-            | "toLowerCase" | "toUpperCase" | "substring" | "padStart" | "padEnd" | "repeat"
-            | "test" | "toString" | "valueOf" | "then" | "catch" | "finally" | "bind"
-            | "call" | "apply" | "hasOwnProperty" => Some(AbsenceValue::present()),
+            "map" | "filter" | "reduce" | "forEach" | "some" | "every" | "includes" | "indexOf"
+            | "lastIndexOf" | "join" | "slice" | "concat" | "flat" | "flatMap" | "push"
+            | "unshift" | "splice" | "reverse" | "sort" | "keys" | "values" | "entries" | "has"
+            | "set" | "add" | "delete" | "clear" | "trim" | "trimStart" | "trimEnd" | "split"
+            | "replace" | "replaceAll" | "startsWith" | "endsWith" | "toLowerCase"
+            | "toUpperCase" | "substring" | "padStart" | "padEnd" | "repeat" | "test"
+            | "toString" | "valueOf" | "then" | "catch" | "finally" | "bind" | "call" | "apply"
+            | "hasOwnProperty" => Some(AbsenceValue::present()),
             _ => None,
         },
     }

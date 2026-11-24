@@ -16,6 +16,63 @@ function M.is_nvim_011()
   return is_011
 end
 
+local function read_line_no_bufload(uri, bufnr, line_nr)
+  if bufnr and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
+    return vim.api.nvim_buf_get_lines(bufnr, line_nr, line_nr + 1, false)[1]
+  end
+  local fname = vim.uri_to_fname(uri)
+  local fh = io.open(fname, "rb")
+  if not fh then
+    return nil
+  end
+  local cur = 0
+  local target = nil
+  for l in fh:lines() do
+    if cur == line_nr then
+      target = l
+      break
+    end
+    cur = cur + 1
+  end
+  fh:close()
+  return target
+end
+
+function M.utf8_col_to_encoding(line_str, byte_col, offset_encoding)
+  local enc = offset_encoding or "utf-16"
+  if enc == "utf-8" or enc == "utf8" then
+    return byte_col
+  end
+  if not line_str or line_str == "" then
+    return byte_col
+  end
+  local clamped = math.max(0, math.min(byte_col, #line_str))
+  if is_011 then
+    local target_enc = (enc == "utf-32" or enc == "utf32") and "utf-32" or "utf-16"
+    return vim.str_utfindex(line_str, target_enc, clamped)
+  end
+  local utf16, utf32 = vim.str_utfindex(line_str, clamped)
+  if enc == "utf-32" or enc == "utf32" then
+    return utf32
+  end
+  return utf16
+end
+
+local function item_position_for_client(item, bufnr, client)
+  local pos = item.position or { line = 0, character = 0 }
+  local target_enc = (client and client.offset_encoding) or "utf-16"
+  local item_enc = item.offset_encoding or "utf-8"
+  if item_enc ~= "utf-8" and item_enc ~= "utf8" then
+    return { line = pos.line, character = pos.character }
+  end
+  if target_enc == "utf-8" or target_enc == "utf8" then
+    return { line = pos.line, character = pos.character }
+  end
+  local line_str = read_line_no_bufload(item.uri, bufnr, pos.line)
+  local conv_col = M.utf8_col_to_encoding(line_str, pos.character, target_enc)
+  return { line = pos.line, character = conv_col }
+end
+
 function M.get_clients(bufnr)
   return vim.lsp.get_clients({ bufnr = bufnr })
 end
@@ -88,9 +145,7 @@ local function normalize_call_hierarchy_incoming(result)
   for _, entry in ipairs(result) do
     local from = entry.from
     if from and from.uri then
-      local range = (entry.fromRanges and entry.fromRanges[1])
-        or from.selectionRange
-        or from.range
+      local range = (entry.fromRanges and entry.fromRanges[1]) or from.selectionRange or from.range
       if range and range.start and range["end"] then
         table.insert(out, {
           uri = from.uri,
@@ -125,6 +180,7 @@ function M.resolve_batch(params, circuit_open_clients, callback)
   local timeout_ms = params.timeout_ms or 150
   local pending = #items
   local results = {}
+  local item_clients = {}
   local finished = false
 
   active_lsp_requests[query_id] = active_lsp_requests[query_id] or {}
@@ -146,6 +202,7 @@ function M.resolve_batch(params, circuit_open_clients, callback)
             timed_out = true,
             unattached = false,
             circuit_open = false,
+            client_name = item_clients[i],
             latency_ms = timeout_ms,
           }
         end
@@ -198,19 +255,26 @@ function M.resolve_batch(params, circuit_open_clients, callback)
       finish_one()
       return
     end
+    item_clients[idx] = ref_client.name
     local ref_params = {
       textDocument = { uri = item.uri },
-      position = { line = item.position.line, character = item.position.character },
+      position = item_position_for_client(item, bufnr, ref_client),
       context = { includeDeclaration = false },
     }
-    local ok, req_id = M.client_request(ref_client, "textDocument/references", ref_params, function(err, res)
-      if finished then
-        return
-      end
-      local elapsed_ms = math.floor((uv.hrtime() - t0) / 1e6)
-      local locs = (not err and res) and normalize_locations(res) or {}
-      record_result(idx, item, ref_client, locs, elapsed_ms)
-    end, bufnr)
+    local ok, req_id = M.client_request(
+      ref_client,
+      "textDocument/references",
+      ref_params,
+      function(err, res)
+        if finished then
+          return
+        end
+        local elapsed_ms = math.floor((uv.hrtime() - t0) / 1e6)
+        local locs = (not err and res) and normalize_locations(res) or {}
+        record_result(idx, item, ref_client, locs, elapsed_ms)
+      end,
+      bufnr
+    )
     if ok and req_id and active_lsp_requests[query_id] then
       table.insert(active_lsp_requests[query_id], { client = ref_client, req_id = req_id })
     end
@@ -221,39 +285,54 @@ function M.resolve_batch(params, circuit_open_clients, callback)
     local t0 = uv.hrtime()
 
     if item.kind == "callHierarchyIncoming" then
-      local ch_client = M.pick_client(bufnr, "textDocument/prepareCallHierarchy", circuit_open_clients)
+      local ch_client =
+        M.pick_client(bufnr, "textDocument/prepareCallHierarchy", circuit_open_clients)
       if not ch_client then
         send_references(idx, item, bufnr, t0)
       else
+        item_clients[idx] = ch_client.name
         local prep_params = {
           textDocument = { uri = item.uri },
-          position = { line = item.position.line, character = item.position.character },
+          position = item_position_for_client(item, bufnr, ch_client),
         }
-        local ok, req_id = M.client_request(ch_client, "textDocument/prepareCallHierarchy", prep_params, function(err, prep_res)
-          if finished then
-            return
-          end
-          local ch_items = (not err and prep_res and vim.islist(prep_res)) and prep_res or {}
-          if #ch_items == 0 then
-            send_references(idx, item, bufnr, t0)
-            return
-          end
-          local ok2, req_id2 = M.client_request(ch_client, "callHierarchy/incomingCalls", { item = ch_items[1] }, function(err2, inc_res)
+        local ok, req_id = M.client_request(
+          ch_client,
+          "textDocument/prepareCallHierarchy",
+          prep_params,
+          function(err, prep_res)
             if finished then
               return
             end
-            local locs = (not err2 and inc_res) and normalize_call_hierarchy_incoming(inc_res) or {}
-            if #locs == 0 then
+            local ch_items = (not err and prep_res and vim.islist(prep_res)) and prep_res or {}
+            if #ch_items == 0 then
               send_references(idx, item, bufnr, t0)
               return
             end
-            local elapsed_ms = math.floor((uv.hrtime() - t0) / 1e6)
-            record_result(idx, item, ch_client, locs, elapsed_ms)
-          end, bufnr)
-          if ok2 and req_id2 and active_lsp_requests[query_id] then
-            table.insert(active_lsp_requests[query_id], { client = ch_client, req_id = req_id2 })
-          end
-        end, bufnr)
+            local ok2, req_id2 = M.client_request(
+              ch_client,
+              "callHierarchy/incomingCalls",
+              { item = ch_items[1] },
+              function(err2, inc_res)
+                if finished then
+                  return
+                end
+                local locs = (not err2 and inc_res) and normalize_call_hierarchy_incoming(inc_res)
+                  or {}
+                if #locs == 0 then
+                  send_references(idx, item, bufnr, t0)
+                  return
+                end
+                local elapsed_ms = math.floor((uv.hrtime() - t0) / 1e6)
+                record_result(idx, item, ch_client, locs, elapsed_ms)
+              end,
+              bufnr
+            )
+            if ok2 and req_id2 and active_lsp_requests[query_id] then
+              table.insert(active_lsp_requests[query_id], { client = ch_client, req_id = req_id2 })
+            end
+          end,
+          bufnr
+        )
         if ok and req_id and active_lsp_requests[query_id] then
           table.insert(active_lsp_requests[query_id], { client = ch_client, req_id = req_id })
         end
@@ -272,9 +351,10 @@ function M.resolve_batch(params, circuit_open_clients, callback)
         }
         finish_one()
       else
+        item_clients[idx] = client.name
         local req_params = {
           textDocument = { uri = item.uri },
-          position = { line = item.position.line, character = item.position.character },
+          position = item_position_for_client(item, bufnr, client),
         }
         if item.kind == "references" then
           req_params.context = { includeDeclaration = false }

@@ -48,9 +48,14 @@ impl LanguageAdapter for TypeScriptAdapter {
         parse_ts_skeleton(uri, source)
     }
 
-    fn lower_function(&self, uri: &str, source: &str, skeleton: &FunctionSkeleton) -> FunctionIr {
-        let skel = parse_ts_skeleton(uri, source);
-        lower_ts_function(uri, source, skeleton, &skel.imports)
+    fn lower_function(
+        &self,
+        uri: &str,
+        source: &str,
+        file_skeleton: &FileSkeleton,
+        skeleton: &FunctionSkeleton,
+    ) -> FunctionIr {
+        lower_ts_function(uri, source, skeleton, &file_skeleton.imports)
     }
 
     fn extract_declaration_signature(

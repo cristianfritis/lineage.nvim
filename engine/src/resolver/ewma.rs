@@ -95,6 +95,26 @@ impl EwmaTracker {
         }
     }
 
+    pub fn open_clients_for_workspace(&self, workspace_root: &str, now: Instant) -> Vec<String> {
+        let mut guard = self.entries.lock().expect("ewma lock poisoned");
+        let mut open = Vec::new();
+        for (k, entry) in guard.iter_mut() {
+            if k.workspace_root == workspace_root {
+                if entry.state == CircuitState::Open {
+                    if let Some(opened_at) = entry.opened_at {
+                        if now.duration_since(opened_at) >= CIRCUIT_OPEN_DURATION {
+                            entry.state = CircuitState::HalfOpen;
+                        }
+                    }
+                }
+                if entry.state == CircuitState::Open {
+                    open.push(k.client_name.clone());
+                }
+            }
+        }
+        open
+    }
+
     pub fn snapshots(&self) -> Vec<ClientHealthSnapshot> {
         let guard = self.entries.lock().expect("ewma lock poisoned");
         guard

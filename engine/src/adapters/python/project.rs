@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
+use moka::sync::Cache;
 
 use crate::adapters::typescript::tsconfig::safe_join;
 use crate::adapters::ImportResolution;
@@ -12,31 +12,38 @@ pub struct PyProjectMeta {
     pub source_roots: Vec<PathBuf>,
 }
 
-#[derive(Default)]
 pub struct PyProjectCache {
-    by_dir: Mutex<HashMap<PathBuf, Option<PyProjectMeta>>>,
+    by_dir: Cache<PathBuf, Option<PyProjectMeta>>,
+}
+
+impl Default for PyProjectCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PyProjectCache {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            by_dir: Cache::new(64),
+        }
     }
 
-    pub fn find_for_file(&self, file: &Path, workspace_root: Option<&Path>) -> Option<PyProjectMeta> {
+    pub fn find_for_file(
+        &self,
+        file: &Path,
+        workspace_root: Option<&Path>,
+    ) -> Option<PyProjectMeta> {
         let start_dir = file.parent()?;
         let mut cur = Some(start_dir);
         while let Some(dir) = cur {
-            {
-                let cache = self.by_dir.lock().expect("pyproject cache lock");
-                if let Some(cached) = cache.get(dir) {
-                    return cached.clone();
-                }
+            if let Some(cached) = self.by_dir.get(dir) {
+                return cached;
             }
             let pyproject = dir.join("pyproject.toml");
             if pyproject.is_file() {
                 let meta = parse_pyproject(&pyproject, dir);
-                let mut cache = self.by_dir.lock().expect("pyproject cache lock");
-                cache.insert(dir.to_path_buf(), meta.clone());
+                self.by_dir.insert(dir.to_path_buf(), meta.clone());
                 return meta;
             }
             if let Some(root) = workspace_root {

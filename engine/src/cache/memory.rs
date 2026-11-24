@@ -5,8 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use moka::sync::Cache;
-use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-use tree_sitter::Tree;
+use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 use crate::ir::{FileSkeleton, FunctionIr};
 use crate::protocol::schema::UnknownReason;
@@ -15,7 +14,6 @@ pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_LINE_BYTES: usize = 4096;
 pub const MAX_DIRTY_BUFFERS: usize = 32;
 pub const MAX_DIRTY_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_ARENA_TREES: usize = 4;
 
 pub fn compute_cache_cap_bytes() -> u64 {
     let mut sys = System::new_with_specifics(
@@ -23,10 +21,21 @@ pub fn compute_cache_cap_bytes() -> u64 {
     );
     sys.refresh_memory();
     let total_ram = sys.total_memory();
-    let five_pct = total_ram.saturating_mul(5) / 100;
-    let min_cap = 128 * 1024 * 1024;
-    let max_cap = 300 * 1024 * 1024;
-    five_pct.clamp(min_cap, max_cap)
+    let three_pct = total_ram.saturating_mul(3) / 100;
+    let min_cap = 64 * 1024 * 1024;
+    let max_cap = 140 * 1024 * 1024;
+    three_pct.clamp(min_cap, max_cap)
+}
+
+pub fn current_process_rss_bytes() -> Option<u64> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_memory(),
+    );
+    sys.process(pid).map(|p| p.memory())
 }
 
 pub fn parse_worker_cap() -> usize {
@@ -317,36 +326,14 @@ impl DirtyBufferOverlay {
     }
 }
 
-/// Query-scoped syntax tree arena retaining at most 4 parsed `Tree`s and dropped on query end.
-#[derive(Default)]
-pub struct SliceArena {
-    trees: Vec<(String, Tree)>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl SliceArena {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert_tree(&mut self, uri: String, tree: Tree) {
-        if let Some(pos) = self.trees.iter().position(|(u, _)| u == &uri) {
-            self.trees.remove(pos);
-        }
-        if self.trees.len() >= MAX_ARENA_TREES {
-            self.trees.remove(0);
-        }
-        self.trees.push((uri, tree));
-    }
-
-    pub fn get_tree(&self, uri: &str) -> Option<&Tree> {
-        self.trees.iter().find(|(u, _)| u == uri).map(|(_, t)| t)
-    }
-
-    pub fn len(&self) -> usize {
-        self.trees.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.trees.is_empty()
+    #[test]
+    fn cache_cap_bytes_within_calibrated_bounds() {
+        let cap = compute_cache_cap_bytes();
+        assert!(cap >= 64 * 1024 * 1024, "cap too small: {cap}");
+        assert!(cap <= 140 * 1024 * 1024, "cap too large: {cap}");
     }
 }

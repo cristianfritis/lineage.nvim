@@ -1,0 +1,23 @@
+{
+  "version": "0.1.0",
+  "engine_tag": "engine-v0.1.0",
+  "repo": "cristianfritis/lineage.nvim",
+  "targets": {
+    "x86_64-unknown-linux-musl": {
+      "asset": "lineage-engine-x86_64-unknown-linux-musl",
+      "sha256": "TBD"
+    },
+    "aarch64-unknown-linux-musl": {
+      "asset": "lineage-engine-aarch64-unknown-linux-musl",
+      "sha256": "TBD"
+    },
+    "aarch64-apple-darwin": {
+      "asset": "lineage-engine-aarch64-apple-darwin",
+      "sha256": "TBD"
+    },
+    "x86_64-apple-darwin": {
+      "asset": "lineage-engine-x86_64-apple-darwin",
+      "sha256": "TBD"
+    }
+  }
+}

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::adapters::{ImportResolution, LanguageAdapter};
 use crate::cache::{
     check_text_guards, read_file_guarded, uri_to_path, DirtyBufferOverlay, DiskStamp, FileIrCache,
-    GuardError, SliceArena,
+    GuardError,
 };
 use crate::ir::{
     AbsenceValue, CallTarget, FileSkeleton, FunctionIr, GuardEnv, SsiInst, SsiOp, ValueId,
@@ -20,14 +20,14 @@ use crate::ir::{
 use crate::protocol::schema::{
     CanonicalPos, CanonicalRange, ExpandParams, ExpandResult, FileEntry, HoverItem, HoverRisk,
     LspPosition, LspResolveBatchParams, LspResolveItem, LspResolveKind, OffsetEncoding, RpcError,
-    SliceDirection, SliceEnvelope, SliceParams, SliceProjections, SliceStats, TruncationReason,
-    UnknownBoundary, UnknownReason, SCHEMA_VERSION,
+    SliceDirection, SliceEnvelope, SliceGraph, SliceParams, SliceProjections, SliceStats, TreeRow,
+    TruncationReason, UnknownBoundary, UnknownReason, SCHEMA_VERSION,
 };
 use crate::resolver::discover_callers;
 use crate::resolver::lsp_provider::{
     DEFAULT_LSP_TIMEOUT_MS, MAX_IMPLEMENTATION_TARGETS, PHASE2_CEILING_MS,
 };
-use crate::resolver::SymbolResolver;
+use crate::resolver::{ResolveContext, SymbolResolver};
 use crate::slicer::pipeline::{run_reduction_pipeline, RawSliceEdge, RawSliceNode};
 use crate::slicer::projectors::{project_focus_spans, project_hover_card, project_tree_rows};
 use crate::text::PositionMapper;
@@ -100,6 +100,7 @@ impl SlicerEngine {
         &self,
         uri: &str,
         text: &str,
+        file_skeleton: &FileSkeleton,
         skel: &crate::ir::FunctionSkeleton,
         adapter: &Arc<dyn LanguageAdapter>,
     ) -> Arc<FunctionIr> {
@@ -109,7 +110,7 @@ impl SlicerEngine {
         {
             return cached;
         }
-        let ir = Arc::new(adapter.lower_function(uri, text, skel));
+        let ir = Arc::new(adapter.lower_function(uri, text, file_skeleton, skel));
         self.cache.insert_function(
             uri.to_string(),
             skel.symbol_id.clone(),
@@ -129,9 +130,23 @@ impl SlicerEngine {
     where
         F: FnMut(SliceEnvelope),
     {
+        let (phase1_env, phase2_opt) = self.slice_phase1(params, trace_id, cancel)?;
+        if let (Some(ctx), Some(ref mut emit_delta)) = (phase2_opt, &mut on_delta) {
+            if let Some(delta) = self.execute_phase2(ctx, cancel) {
+                emit_delta(delta);
+            }
+        }
+        Ok(phase1_env)
+    }
+
+    pub fn slice_phase1(
+        &self,
+        params: &SliceParams,
+        trace_id: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(SliceEnvelope, Option<Phase2Context>), RpcError> {
         let start = Instant::now();
         let query_id = params.query_id.unwrap_or(1);
-        let _arena = SliceArena::new(); // Query-scoped arena dropped on return.
 
         let adapter = self.adapter_for_uri(&params.uri).ok_or_else(|| {
             RpcError::invalid_params(format!("Unsupported file type: {}", params.uri))
@@ -140,7 +155,10 @@ impl SlicerEngine {
         let (skeleton, text) = match self.get_or_parse_skeleton(&params.uri, adapter) {
             Ok(v) => v,
             Err(guard_err) => {
-                return Ok(self.guard_error_envelope(params, query_id, trace_id, guard_err, start));
+                return Ok((
+                    self.guard_error_envelope(params, query_id, trace_id, guard_err, start),
+                    None,
+                ));
             }
         };
 
@@ -161,7 +179,7 @@ impl SlicerEngine {
             .or_else(|| skeleton.functions.first())
             .ok_or_else(|| RpcError::internal("No function skeleton found"))?;
 
-        let fn_ir = self.get_or_lower_function(&params.uri, &text, fn_skel, adapter);
+        let fn_ir = self.get_or_lower_function(&params.uri, &text, &skeleton, fn_skel, adapter);
 
         let target_vid = fn_ir
             .lookup_at_pos(canonical_pos)
@@ -178,6 +196,7 @@ impl SlicerEngine {
         let mut eval = self.evaluate_function_ir(
             &params.uri,
             &skeleton,
+            &text,
             &fn_ir,
             target_vid,
             adapter,
@@ -210,7 +229,8 @@ impl SlicerEngine {
                     .map(Path::new)
                     .or_else(|| target_path.parent())
                     .unwrap_or_else(|| Path::new("."));
-                let scan = discover_callers(ws_root, &fn_ir.name, &target_path, params.exclude_tests);
+                let scan =
+                    discover_callers(ws_root, &fn_ir.name, &target_path, params.exclude_tests);
                 if let Some(reason) = scan.truncated {
                     extra_truncation.push(reason);
                 }
@@ -259,8 +279,15 @@ impl SlicerEngine {
             }
         }
 
-        let phase1_ms = start.elapsed().as_millis() as u64;
-        let phase1_budget = Duration::from_millis(50);
+        let phase1_budget = if params.include_tree
+            || matches!(
+                params.direction,
+                SliceDirection::From | SliceDirection::Both
+            ) {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_millis(50)
+        };
 
         let pipeline_out = run_reduction_pipeline(
             &eval.root_ids,
@@ -312,6 +339,8 @@ impl SlicerEngine {
             None
         };
 
+        let phase1_ms = start.elapsed().as_millis() as u64;
+
         let phase1_envelope = SliceEnvelope {
             schema_version: SCHEMA_VERSION,
             query_id,
@@ -338,74 +367,223 @@ impl SlicerEngine {
                 contracted_chains: pipeline_out.contracted_chains,
                 unknown_external_generic_calls: eval.unknown_external_generic_calls,
                 total_external_generic_calls: eval.total_external_generic_calls,
+                uninstalled_external_calls: eval.uninstalled_external_calls,
             },
         };
 
-        // Phase 2: if LSP is attached and open LSP-resolvable boundaries exist and not cancelled
-        if params.lsp_attached && !eval.pending_lsp_items.is_empty() && !cancel.load(Ordering::Relaxed) {
-            if let Some(ref mut emit_delta) = on_delta {
-                let batch = LspResolveBatchParams {
-                    query_id,
-                    trace_id: trace_id.to_string(),
-                    depth: 1,
-                    timeout_ms: DEFAULT_LSP_TIMEOUT_MS,
-                    items: eval.pending_lsp_items.clone(),
-                };
-                let batch_res = self.resolver().resolve_batch(batch, Instant::now());
-                let mut phase2_items = Vec::new();
-                let mut updated_boundaries = eval.unknown_boundaries.clone();
-                let mut resolved_absence = eval.target_absence;
+        tracing::info!(
+            trace_id = %trace_id,
+            query_id = query_id,
+            method = "lineage/slice",
+            uri = %params.uri,
+            phase1_ms = phase1_ms,
+            phase2_ms = 0u64,
+            truncation = ?phase1_envelope.truncation,
+            unknown_count = eval.unknown_boundaries.len(),
+            "phase1 slice completed"
+        );
 
-                for item_res in batch_res.results {
-                    if item_res.timed_out {
-                        updated_boundaries.push(UnknownBoundary {
-                            file_id: 0,
-                            uri: params.uri.clone(),
-                            range: fn_ir.range,
-                            symbol: item_res.key.clone(),
-                            reason: UnknownReason::LspTimeout,
-                        });
-                        continue;
-                    }
-                    if item_res.circuit_open {
-                        updated_boundaries.push(UnknownBoundary {
-                            file_id: 0,
-                            uri: params.uri.clone(),
-                            range: fn_ir.range,
-                            symbol: item_res.key.clone(),
-                            reason: UnknownReason::CircuitOpen,
-                        });
-                        continue;
-                    }
-                    if item_res.unattached {
-                        continue;
-                    }
-                    if item_res.locations.len() > MAX_IMPLEMENTATION_TARGETS {
-                        updated_boundaries.push(UnknownBoundary {
-                            file_id: 0,
-                            uri: params.uri.clone(),
-                            range: fn_ir.range,
-                            symbol: item_res.key.clone(),
-                            reason: UnknownReason::PolymorphicCap,
-                        });
-                        continue;
-                    }
-                    for loc in item_res.locations {
-                        if start.elapsed() > Duration::from_millis(PHASE2_CEILING_MS) {
-                            break;
+        let phase2_ctx = if params.lsp_attached
+            && !eval.pending_lsp_items.is_empty()
+            && !cancel.load(Ordering::Relaxed)
+        {
+            Some(Phase2Context {
+                params: params.clone(),
+                trace_id: trace_id.to_string(),
+                query_id,
+                start,
+                files,
+                file_ids,
+                fn_name: fn_ir.name.clone(),
+                fn_range: fn_ir.range,
+                symbol_name,
+                eval,
+                pipeline_graph: pipeline_out.graph,
+                pipeline_nodes_visited: pipeline_out.nodes_visited,
+                pipeline_contracted_chains: pipeline_out.contracted_chains,
+                truncation,
+                phase1_ms,
+                phase1_focus_spans: phase1_envelope.projections.focus_spans.clone(),
+                phase1_tree_rows: phase1_envelope.projections.tree_rows.clone(),
+                phase1_nodes_emitted: phase1_envelope.stats.nodes_emitted,
+            })
+        } else {
+            None
+        };
+
+        Ok((phase1_envelope, phase2_ctx))
+    }
+
+    pub fn execute_phase2(
+        &self,
+        mut ctx: Phase2Context,
+        cancel: &AtomicBool,
+    ) -> Option<SliceEnvelope> {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let max_timeout_ms = ctx.params.lsp_timeout_ms.unwrap_or(DEFAULT_LSP_TIMEOUT_MS);
+        let batch = LspResolveBatchParams {
+            query_id: ctx.query_id,
+            trace_id: ctx.trace_id.clone(),
+            depth: 1,
+            timeout_ms: 0,
+            items: ctx.eval.pending_lsp_items.clone(),
+            circuit_open_clients: Vec::new(),
+            max_timeout_ms: Some(max_timeout_ms),
+        };
+        let resolve_ctx = ResolveContext {
+            workspace_root: ctx.params.workspace_root.clone(),
+            lsp_client_name: ctx.params.lsp_client_name.clone(),
+        };
+        let batch_res = self
+            .resolver()
+            .resolve_batch(batch, &resolve_ctx, Instant::now());
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let adapter = self.adapter_for_uri(&ctx.params.uri);
+        let mut phase2_items = Vec::new();
+        let mut phase2_tree_rows: Vec<TreeRow> = Vec::new();
+        let mut updated_boundaries = ctx.eval.unknown_boundaries.clone();
+        let mut resolved_absence = ctx.eval.target_absence;
+
+        for (idx, item_res) in batch_res.results.into_iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let item_kind = ctx
+                .eval
+                .pending_lsp_items
+                .get(idx)
+                .filter(|it| it.key == item_res.key)
+                .or_else(|| {
+                    ctx.eval
+                        .pending_lsp_items
+                        .iter()
+                        .find(|it| it.key == item_res.key)
+                })
+                .map(|it| it.kind)
+                .unwrap_or(LspResolveKind::Definition);
+
+            if item_res.timed_out {
+                updated_boundaries.push(UnknownBoundary {
+                    file_id: 0,
+                    uri: ctx.params.uri.clone(),
+                    range: ctx.fn_range,
+                    symbol: item_res.key.clone(),
+                    reason: UnknownReason::LspTimeout,
+                });
+                continue;
+            }
+            if item_res.circuit_open {
+                updated_boundaries.push(UnknownBoundary {
+                    file_id: 0,
+                    uri: ctx.params.uri.clone(),
+                    range: ctx.fn_range,
+                    symbol: item_res.key.clone(),
+                    reason: UnknownReason::CircuitOpen,
+                });
+                continue;
+            }
+            if item_res.unattached {
+                continue;
+            }
+            if item_res.locations.len() > MAX_IMPLEMENTATION_TARGETS
+                && item_kind != LspResolveKind::CallHierarchyIncoming
+            {
+                updated_boundaries.push(UnknownBoundary {
+                    file_id: 0,
+                    uri: ctx.params.uri.clone(),
+                    range: ctx.fn_range,
+                    symbol: item_res.key.clone(),
+                    reason: UnknownReason::PolymorphicCap,
+                });
+                continue;
+            }
+
+            if item_kind == LspResolveKind::CallHierarchyIncoming {
+                if item_res.locations.is_empty() {
+                    let target_path = uri_to_path(&ctx.params.uri);
+                    let ws_root = ctx
+                        .params
+                        .workspace_root
+                        .as_deref()
+                        .map(Path::new)
+                        .or_else(|| target_path.parent())
+                        .unwrap_or_else(|| Path::new("."));
+                    let scan = discover_callers(
+                        ws_root,
+                        &ctx.fn_name,
+                        &target_path,
+                        ctx.params.exclude_tests,
+                    );
+                    if let Some(reason) = scan.truncated {
+                        if !ctx.truncation.contains(&reason) {
+                            ctx.truncation.push(reason);
                         }
-                        let fid = if let Some(&existing) = file_ids.get(&loc.uri) {
+                    }
+                    for (cidx, caller) in scan.callers.into_iter().enumerate() {
+                        let fid = if let Some(&existing) = ctx.file_ids.get(&caller.uri) {
                             existing
                         } else {
-                            let id = files.len() as u32;
-                            files.push(FileEntry {
+                            let id = ctx.files.len() as u32;
+                            ctx.files.push(FileEntry {
+                                file_id: id,
+                                uri: caller.uri.clone(),
+                            });
+                            ctx.file_ids.insert(caller.uri.clone(), id);
+                            id
+                        };
+                        let is_absent = resolved_absence.is_maybe_absent();
+                        let badge = if is_absent {
+                            "[NULL]".to_string()
+                        } else if resolved_absence.has_unknown()
+                            || resolved_absence == AbsenceValue::bottom()
+                        {
+                            "[?]".to_string()
+                        } else {
+                            "[OK]".to_string()
+                        };
+                        phase2_tree_rows.push(TreeRow {
+                            node_id: format!("caller:{fid}:{cidx}"),
+                            depth: 1,
+                            file_id: fid,
+                            uri: caller.uri.clone(),
+                            range: caller.range,
+                            label: format!("{} -> {}", caller.caller_name, ctx.fn_name),
+                            badge,
+                            is_cycle: false,
+                            is_frontier: false,
+                            expansion_token: None,
+                            is_absent,
+                            group_key: ctx.symbol_name.clone(),
+                            provenance: "ripgrep_caller".to_string(),
+                            has_children: false,
+                            snippet: if ctx.params.include_snippets {
+                                caller.snippet
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                } else {
+                    for (cidx, loc) in item_res.locations.into_iter().enumerate() {
+                        if ctx.start.elapsed() > Duration::from_millis(PHASE2_CEILING_MS) {
+                            break;
+                        }
+                        let fid = if let Some(&existing) = ctx.file_ids.get(&loc.uri) {
+                            existing
+                        } else {
+                            let id = ctx.files.len() as u32;
+                            ctx.files.push(FileEntry {
                                 file_id: id,
                                 uri: loc.uri.clone(),
                             });
-                            file_ids.insert(loc.uri.clone(), id);
+                            ctx.file_ids.insert(loc.uri.clone(), id);
                             id
                         };
-
                         let mut loc_range = CanonicalRange {
                             start: CanonicalPos {
                                 line: loc.start.line,
@@ -416,111 +594,223 @@ impl SlicerEngine {
                                 col: loc.end.character,
                             },
                         };
-
-                        // If target is a .d.ts or .pyi stub, extract outer-wrapper signature
-                        if loc.uri.ends_with(".d.ts") || loc.uri.ends_with(".pyi") {
-                            if let Ok((stub_text, _)) = self.load_source(&loc.uri) {
-                                let stub_mapper = PositionMapper::new(&stub_text);
-                                let enc = item_res.offset_encoding.unwrap_or(OffsetEncoding::Utf16);
-                                loc_range = CanonicalRange {
-                                    start: stub_mapper.lsp_to_canonical(loc.start, enc),
-                                    end: stub_mapper.lsp_to_canonical(loc.end, enc),
-                                };
-                                if let Some(sig_abs) = adapter.extract_declaration_signature(
-                                    &loc.uri,
-                                    &stub_text,
-                                    &item_res.key,
-                                ) {
-                                    resolved_absence = resolved_absence.join(sig_abs);
-                                }
-                            }
-                        } else if let Some(target_adapter) = self.adapter_for_uri(&loc.uri) {
-                            if let Ok((target_skel, target_text)) =
-                                self.get_or_parse_skeleton(&loc.uri, target_adapter)
-                            {
-                                let target_mapper = PositionMapper::new(&target_text);
-                                let enc = item_res.offset_encoding.unwrap_or(OffsetEncoding::Utf16);
-                                let cpos = target_mapper.lsp_to_canonical(loc.start, enc);
-                                loc_range = CanonicalRange {
-                                    start: cpos,
-                                    end: target_mapper.lsp_to_canonical(loc.end, enc),
-                                };
-                                if let Some(fskel) = target_skel
-                                    .functions
-                                    .iter()
-                                    .find(|f| f.range.start <= cpos && cpos <= f.range.end)
-                                {
-                                    let target_ir = self.get_or_lower_function(
-                                        &loc.uri,
-                                        &target_text,
-                                        fskel,
-                                        target_adapter,
-                                    );
-                                    resolved_absence = resolved_absence
-                                        .join(target_ir.local_summary.return_absence);
-                                }
-                            }
+                        if let Ok((caller_text, _)) = self.load_source(&loc.uri) {
+                            let mapper = PositionMapper::new(&caller_text);
+                            let enc = item_res.offset_encoding.unwrap_or(OffsetEncoding::Utf16);
+                            loc_range = CanonicalRange {
+                                start: mapper.lsp_to_canonical(loc.start, enc),
+                                end: mapper.lsp_to_canonical(loc.end, enc),
+                            };
                         }
-
-                        phase2_items.push(HoverItem {
-                            index: 0,
+                        let is_absent = resolved_absence.is_maybe_absent();
+                        let badge = if is_absent {
+                            "[NULL]".to_string()
+                        } else if resolved_absence.has_unknown()
+                            || resolved_absence == AbsenceValue::bottom()
+                        {
+                            "[?]".to_string()
+                        } else {
+                            "[OK]".to_string()
+                        };
+                        phase2_tree_rows.push(TreeRow {
+                            node_id: format!("lsp_caller:{fid}:{cidx}"),
+                            depth: 1,
                             file_id: fid,
                             uri: loc.uri.clone(),
                             range: loc_range,
-                            label: format!("LSP target {}", item_res.key),
+                            label: format!("caller -> {}", ctx.fn_name),
+                            badge,
+                            is_cycle: false,
+                            is_frontier: false,
+                            expansion_token: None,
+                            is_absent,
+                            group_key: ctx.symbol_name.clone(),
+                            provenance: "lsp_call_hierarchy".to_string(),
+                            has_children: false,
                             snippet: None,
-                            provenance: "lsp_definition".to_string(),
-                            is_absent_origin: resolved_absence.is_maybe_absent(),
                         });
                     }
                 }
+                continue;
+            }
 
-                let phase2_ms = start.elapsed().as_millis() as u64;
-                let updated_card = project_hover_card(
-                    &symbol_name,
-                    resolved_absence,
-                    &files,
-                    eval.hover_items,
-                    phase2_items,
-                    eval.guards,
-                    eval.local_risks,
-                    updated_boundaries,
-                    &truncation,
-                );
+            if !item_res.locations.is_empty() {
+                updated_boundaries.retain(|b| {
+                    !(b.symbol == item_res.key
+                        && matches!(
+                            b.reason,
+                            UnknownReason::ExternalUntyped
+                                | UnknownReason::ExternalUninstalled
+                                | UnknownReason::BarrelFanoutCap
+                        ))
+                });
+            }
 
-                let delta_env = SliceEnvelope {
-                    schema_version: SCHEMA_VERSION,
-                    query_id,
-                    trace_id: trace_id.to_string(),
-                    root_ids: eval.root_ids,
-                    direction: params.direction,
-                    files,
-                    graph: if params.include_graph {
-                        Some(pipeline_out.graph.clone())
-                    } else {
-                        None
+            for loc in item_res.locations {
+                if ctx.start.elapsed() > Duration::from_millis(PHASE2_CEILING_MS) {
+                    break;
+                }
+                let fid = if let Some(&existing) = ctx.file_ids.get(&loc.uri) {
+                    existing
+                } else {
+                    let id = ctx.files.len() as u32;
+                    ctx.files.push(FileEntry {
+                        file_id: id,
+                        uri: loc.uri.clone(),
+                    });
+                    ctx.file_ids.insert(loc.uri.clone(), id);
+                    id
+                };
+
+                let mut loc_range = CanonicalRange {
+                    start: CanonicalPos {
+                        line: loc.start.line,
+                        col: loc.start.character,
                     },
-                    projections: SliceProjections {
-                        hover_card: Some(updated_card),
-                        focus_spans: phase1_envelope.projections.focus_spans.clone(),
-                        tree_rows: phase1_envelope.projections.tree_rows.clone(),
-                    },
-                    truncation,
-                    stats: SliceStats {
-                        phase1_ms,
-                        phase2_ms,
-                        nodes_visited: pipeline_out.nodes_visited,
-                        nodes_emitted: phase1_envelope.stats.nodes_emitted,
-                        contracted_chains: pipeline_out.contracted_chains,
-                        unknown_external_generic_calls: eval.unknown_external_generic_calls,
-                        total_external_generic_calls: eval.total_external_generic_calls,
+                    end: CanonicalPos {
+                        line: loc.end.line,
+                        col: loc.end.character,
                     },
                 };
-                emit_delta(delta_env);
+
+                // If target is a .d.ts or .pyi stub, extract outer-wrapper signature
+                if loc.uri.ends_with(".d.ts") || loc.uri.ends_with(".pyi") {
+                    if let Ok((stub_text, _)) = self.load_source(&loc.uri) {
+                        let stub_mapper = PositionMapper::new(&stub_text);
+                        let enc = item_res.offset_encoding.unwrap_or(OffsetEncoding::Utf16);
+                        loc_range = CanonicalRange {
+                            start: stub_mapper.lsp_to_canonical(loc.start, enc),
+                            end: stub_mapper.lsp_to_canonical(loc.end, enc),
+                        };
+                        if let Some(ad) = adapter {
+                            if let Some(sig_abs) = ad.extract_declaration_signature(
+                                &loc.uri,
+                                &stub_text,
+                                &item_res.key,
+                            ) {
+                                resolved_absence = resolved_absence.join(sig_abs);
+                            }
+                        }
+                    }
+                } else if let Some(target_adapter) = self.adapter_for_uri(&loc.uri) {
+                    if let Ok((target_skel, target_text)) =
+                        self.get_or_parse_skeleton(&loc.uri, target_adapter)
+                    {
+                        let target_mapper = PositionMapper::new(&target_text);
+                        let enc = item_res.offset_encoding.unwrap_or(OffsetEncoding::Utf16);
+                        let cpos = target_mapper.lsp_to_canonical(loc.start, enc);
+                        loc_range = CanonicalRange {
+                            start: cpos,
+                            end: target_mapper.lsp_to_canonical(loc.end, enc),
+                        };
+                        if let Some(fskel) = target_skel
+                            .functions
+                            .iter()
+                            .find(|f| f.range.start <= cpos && cpos <= f.range.end)
+                        {
+                            let target_ir = self.get_or_lower_function(
+                                &loc.uri,
+                                &target_text,
+                                &target_skel,
+                                fskel,
+                                target_adapter,
+                            );
+                            resolved_absence =
+                                resolved_absence.join(target_ir.local_summary.return_absence);
+                        }
+                    }
+                }
+
+                phase2_items.push(HoverItem {
+                    index: 0,
+                    file_id: fid,
+                    uri: loc.uri.clone(),
+                    range: loc_range,
+                    label: format!("LSP target {}", item_res.key),
+                    snippet: None,
+                    provenance: "lsp_definition".to_string(),
+                    is_absent_origin: resolved_absence.is_maybe_absent(),
+                });
             }
         }
 
-        Ok(phase1_envelope)
+        if !updated_boundaries
+            .iter()
+            .any(|b| b.reason == UnknownReason::ExternalUntyped)
+        {
+            resolved_absence = resolved_absence.without_unknown(UnknownReason::ExternalUntyped);
+        }
+        if !updated_boundaries
+            .iter()
+            .any(|b| b.reason == UnknownReason::ExternalUninstalled)
+        {
+            resolved_absence = resolved_absence.without_unknown(UnknownReason::ExternalUninstalled);
+        }
+
+        let phase2_ms = ctx.start.elapsed().as_millis() as u64;
+        let updated_card = project_hover_card(
+            &ctx.symbol_name,
+            resolved_absence,
+            &ctx.files,
+            ctx.eval.hover_items,
+            phase2_items,
+            ctx.eval.guards,
+            ctx.eval.local_risks,
+            updated_boundaries.clone(),
+            &ctx.truncation,
+        );
+
+        let merged_tree_rows = if ctx.params.include_tree {
+            let mut rows = ctx.phase1_tree_rows.unwrap_or_default();
+            rows.extend(phase2_tree_rows);
+            Some(rows)
+        } else {
+            ctx.phase1_tree_rows
+        };
+
+        let delta_env = SliceEnvelope {
+            schema_version: SCHEMA_VERSION,
+            query_id: ctx.query_id,
+            trace_id: ctx.trace_id.clone(),
+            root_ids: ctx.eval.root_ids,
+            direction: ctx.params.direction,
+            files: ctx.files,
+            graph: if ctx.params.include_graph {
+                Some(ctx.pipeline_graph)
+            } else {
+                None
+            },
+            projections: SliceProjections {
+                hover_card: Some(updated_card),
+                focus_spans: ctx.phase1_focus_spans,
+                tree_rows: merged_tree_rows,
+            },
+            truncation: ctx.truncation.clone(),
+            stats: SliceStats {
+                phase1_ms: ctx.phase1_ms,
+                phase2_ms,
+                nodes_visited: ctx.pipeline_nodes_visited,
+                nodes_emitted: ctx.phase1_nodes_emitted,
+                contracted_chains: ctx.pipeline_contracted_chains,
+                unknown_external_generic_calls: ctx.eval.unknown_external_generic_calls,
+                total_external_generic_calls: ctx.eval.total_external_generic_calls,
+                uninstalled_external_calls: ctx.eval.uninstalled_external_calls,
+            },
+        };
+
+        tracing::info!(
+            trace_id = %ctx.trace_id,
+            query_id = ctx.query_id,
+            method = "lineage/sliceDelta",
+            uri = %ctx.params.uri,
+            phase1_ms = ctx.phase1_ms,
+            phase2_ms = phase2_ms,
+            truncation = ?ctx.truncation,
+            unknown_count = updated_boundaries.len(),
+            "phase2 slice delta completed"
+        );
+
+        Some(delta_env)
     }
 
     fn backward_reachable(fn_ir: &FunctionIr, target: ValueId) -> HashSet<ValueId> {
@@ -553,10 +843,14 @@ impl SlicerEngine {
                         queue.push_back(*base);
                     }
                 }
-                SsiOp::Const { .. }
-                | SsiOp::Param { .. }
-                | SsiOp::Call { .. }
-                | SsiOp::UnknownOp { .. } => {}
+                SsiOp::Call { inputs, .. } => {
+                    for &arg in inputs {
+                        if visited.insert(arg) {
+                            queue.push_back(arg);
+                        }
+                    }
+                }
+                SsiOp::Const { .. } | SsiOp::Param { .. } | SsiOp::UnknownOp { .. } => {}
             }
         }
         visited
@@ -567,6 +861,7 @@ impl SlicerEngine {
         &self,
         uri: &str,
         skeleton: &FileSkeleton,
+        source_text: &str,
         fn_ir: &FunctionIr,
         target_vid: ValueId,
         adapter: &Arc<dyn LanguageAdapter>,
@@ -586,6 +881,7 @@ impl SlicerEngine {
         let mut pending_lsp_items = Vec::new();
         let mut unknown_external_generic_calls = 0usize;
         let mut total_external_generic_calls = 0usize;
+        let mut uninstalled_external_calls = 0usize;
 
         let reachable = Self::backward_reachable(fn_ir, target_vid);
 
@@ -612,10 +908,12 @@ impl SlicerEngine {
                 let mut dummy_lsp = Vec::new();
                 let mut dummy_unk = 0usize;
                 let mut dummy_tot = 0usize;
+                let mut dummy_uninst = 0usize;
                 let val = self.eval_inst(
                     inst,
                     uri,
                     skeleton,
+                    source_text,
                     &values,
                     &guard_env,
                     adapter,
@@ -623,10 +921,31 @@ impl SlicerEngine {
                     file_ids,
                     workspace_root,
                     start,
-                    if in_slice { &mut unknown_boundaries } else { &mut dummy_bounds },
-                    if in_slice { &mut pending_lsp_items } else { &mut dummy_lsp },
-                    if in_slice { &mut unknown_external_generic_calls } else { &mut dummy_unk },
-                    if in_slice { &mut total_external_generic_calls } else { &mut dummy_tot },
+                    if in_slice {
+                        &mut unknown_boundaries
+                    } else {
+                        &mut dummy_bounds
+                    },
+                    if in_slice {
+                        &mut pending_lsp_items
+                    } else {
+                        &mut dummy_lsp
+                    },
+                    if in_slice {
+                        &mut unknown_external_generic_calls
+                    } else {
+                        &mut dummy_unk
+                    },
+                    if in_slice {
+                        &mut total_external_generic_calls
+                    } else {
+                        &mut dummy_tot
+                    },
+                    if in_slice {
+                        &mut uninstalled_external_calls
+                    } else {
+                        &mut dummy_uninst
+                    },
                 );
                 values.insert(vid, val);
                 if in_slice {
@@ -644,10 +963,19 @@ impl SlicerEngine {
             }
         }
 
-        let target_absence = values
-            .get(&target_vid)
-            .copied()
-            .unwrap_or(AbsenceValue::present());
+        let target_absence = match values.get(&target_vid).copied() {
+            Some(v) => v,
+            None => {
+                unknown_boundaries.push(UnknownBoundary {
+                    file_id: 0,
+                    uri: uri.to_string(),
+                    range: fn_ir.range,
+                    symbol: fn_ir.name.clone(),
+                    reason: UnknownReason::ExternalUntyped,
+                });
+                AbsenceValue::unknown(UnknownReason::ExternalUntyped)
+            }
+        };
 
         let local_risks: Vec<HoverRisk> = fn_ir
             .danger_sinks
@@ -681,6 +1009,7 @@ impl SlicerEngine {
             pending_lsp_items,
             unknown_external_generic_calls,
             total_external_generic_calls,
+            uninstalled_external_calls,
         }
     }
 
@@ -690,6 +1019,7 @@ impl SlicerEngine {
         inst: &SsiInst,
         uri: &str,
         skeleton: &FileSkeleton,
+        source_text: &str,
         values: &HashMap<ValueId, AbsenceValue>,
         guard_env: &GuardEnv,
         adapter: &Arc<dyn LanguageAdapter>,
@@ -701,6 +1031,7 @@ impl SlicerEngine {
         pending_lsp_items: &mut Vec<LspResolveItem>,
         unknown_ext_calls: &mut usize,
         total_ext_calls: &mut usize,
+        uninstalled_ext_calls: &mut usize,
     ) -> AbsenceValue {
         match &inst.op {
             SsiOp::Const { value, .. } => *value,
@@ -742,7 +1073,7 @@ impl SlicerEngine {
                 });
                 AbsenceValue::unknown(*reason)
             }
-            SsiOp::Call { callee, .. } => match callee {
+            SsiOp::Call { callee, inputs, .. } => match callee {
                 CallTarget::Stdlib(sym) => {
                     *total_ext_calls += 1;
                     if let Some(abs) = adapter.stdlib_summary(sym) {
@@ -761,12 +1092,26 @@ impl SlicerEngine {
                 }
                 CallTarget::Local(sym) => {
                     if let Some(fskel) = skeleton.functions.iter().find(|f| f.name == *sym) {
-                        if let Ok((_skel, text)) = self.get_or_parse_skeleton(uri, adapter) {
-                            let callee_ir = self.get_or_lower_function(uri, &text, fskel, adapter);
-                            return callee_ir.local_summary.return_absence;
+                        let callee_ir =
+                            self.get_or_lower_function(uri, source_text, skeleton, fskel, adapter);
+                        let mut ret_abs = callee_ir.local_summary.return_absence;
+                        for &param_idx in &callee_ir.local_summary.param_flow_to_return {
+                            if let Some(&arg_vid) = inputs.get(param_idx) {
+                                if let Some(&arg_val) = values.get(&arg_vid) {
+                                    ret_abs = ret_abs.join(arg_val);
+                                }
+                            }
                         }
+                        return ret_abs;
                     }
-                    AbsenceValue::present()
+                    unknown_boundaries.push(UnknownBoundary {
+                        file_id: 0,
+                        uri: uri.to_string(),
+                        range: inst.range,
+                        symbol: sym.clone(),
+                        reason: UnknownReason::DynamicDispatch,
+                    });
+                    AbsenceValue::unknown(UnknownReason::DynamicDispatch)
                 }
                 CallTarget::Imported {
                     module_specifier,
@@ -813,10 +1158,21 @@ impl SlicerEngine {
                                         let target_ir = self.get_or_lower_function(
                                             &target_uri,
                                             &target_text,
+                                            &target_skel,
                                             fskel,
                                             target_adapter,
                                         );
-                                        return target_ir.local_summary.return_absence;
+                                        let mut ret_abs = target_ir.local_summary.return_absence;
+                                        for &param_idx in
+                                            &target_ir.local_summary.param_flow_to_return
+                                        {
+                                            if let Some(&arg_vid) = inputs.get(param_idx) {
+                                                if let Some(&arg_val) = values.get(&arg_vid) {
+                                                    ret_abs = ret_abs.join(arg_val);
+                                                }
+                                            }
+                                        }
+                                        return ret_abs;
                                     }
                                 }
                             }
@@ -845,7 +1201,14 @@ impl SlicerEngine {
                         ImportResolution::Unresolved => {}
                     }
 
-                    *unknown_ext_calls += 1;
+                    let is_external_pkg = is_external_package_specifier(module_specifier);
+                    let reason = if is_external_pkg {
+                        *uninstalled_ext_calls += 1;
+                        UnknownReason::ExternalUninstalled
+                    } else {
+                        *unknown_ext_calls += 1;
+                        UnknownReason::ExternalUntyped
+                    };
                     pending_lsp_items.push(LspResolveItem {
                         key: symbol.clone(),
                         uri: uri.to_string(),
@@ -861,11 +1224,13 @@ impl SlicerEngine {
                         uri: uri.to_string(),
                         range: inst.range,
                         symbol: symbol.clone(),
-                        reason: UnknownReason::ExternalUntyped,
+                        reason,
                     });
-                    AbsenceValue::unknown(UnknownReason::ExternalUntyped)
+                    AbsenceValue::unknown(reason)
                 }
                 CallTarget::Dynamic(sym) => {
+                    *total_ext_calls += 1;
+                    *unknown_ext_calls += 1;
                     unknown_boundaries.push(UnknownBoundary {
                         file_id: 0,
                         uri: uri.to_string(),
@@ -940,6 +1305,18 @@ impl SlicerEngine {
                         is_back_edge: false,
                         cycle_group_id: None,
                         provenance: "phi".to_string(),
+                    });
+                }
+            }
+            SsiOp::Call { inputs, .. } => {
+                for &arg in inputs {
+                    raw_edges.push(RawSliceEdge {
+                        from: id.clone(),
+                        to: format!("n{}", arg.0),
+                        label: Some("arg".to_string()),
+                        is_back_edge: false,
+                        cycle_group_id: None,
+                        provenance: "call_arg".to_string(),
                     });
                 }
             }
@@ -1027,6 +1404,7 @@ impl SlicerEngine {
     pub fn expand_node(
         &self,
         params: &ExpandParams,
+        trace_id: &str,
         cancel: &AtomicBool,
     ) -> Result<ExpandResult, RpcError> {
         let slice_params = SliceParams {
@@ -1043,8 +1421,9 @@ impl SlicerEngine {
             lsp_attached: params.lsp_attached,
             lsp_client_name: None,
             workspace_root: params.workspace_root.clone(),
+            lsp_timeout_ms: None,
         };
-        let env = self.slice_query::<fn(SliceEnvelope)>(&slice_params, "expand", cancel, None)?;
+        let env = self.slice_query::<fn(SliceEnvelope)>(&slice_params, trace_id, cancel, None)?;
         let tree_rows = env.projections.tree_rows.unwrap_or_default();
         Ok(ExpandResult {
             schema_version: SCHEMA_VERSION,
@@ -1067,7 +1446,7 @@ impl SlicerEngine {
             skel.uri, skel.content_hash
         ));
         for f in &skel.functions {
-            let ir = self.get_or_lower_function(uri, &text, f, adapter);
+            let ir = self.get_or_lower_function(uri, &text, &skel, f, adapter);
             out.push_str(&format!("fn {} ({}):\n", ir.name, ir.symbol_id));
             for b in &ir.blocks {
                 out.push_str(&format!("  bb{} (terminated={}):\n", b.id.0, b.terminated));
@@ -1091,7 +1470,7 @@ impl SlicerEngine {
         let mut out = String::from("digraph cfg {\n");
         let mut seen_nodes = HashSet::new();
         for f in &skel.functions {
-            let ir = self.get_or_lower_function(uri, &text, f, adapter);
+            let ir = self.get_or_lower_function(uri, &text, &skel, f, adapter);
             for b in &ir.blocks {
                 let node_name = format!("\"{}::bb{}\"", ir.name, b.id.0);
                 if seen_nodes.insert(node_name.clone()) {
@@ -1110,6 +1489,35 @@ impl SlicerEngine {
     }
 }
 
+fn is_external_package_specifier(spec: &str) -> bool {
+    !spec.starts_with('.')
+        && !spec.starts_with('/')
+        && !spec.starts_with("crate::")
+        && !spec.starts_with("super::")
+        && !spec.starts_with("self::")
+}
+
+pub struct Phase2Context {
+    params: SliceParams,
+    trace_id: String,
+    query_id: u64,
+    start: Instant,
+    files: Vec<FileEntry>,
+    file_ids: HashMap<String, u32>,
+    fn_name: String,
+    fn_range: CanonicalRange,
+    symbol_name: String,
+    eval: EvalResult,
+    pipeline_graph: SliceGraph,
+    pipeline_nodes_visited: usize,
+    pipeline_contracted_chains: usize,
+    truncation: Vec<TruncationReason>,
+    phase1_ms: u64,
+    phase1_focus_spans: Option<Vec<crate::protocol::schema::FocusSpan>>,
+    phase1_tree_rows: Option<Vec<TreeRow>>,
+    phase1_nodes_emitted: usize,
+}
+
 struct EvalResult {
     root_ids: Vec<String>,
     target_absence: AbsenceValue,
@@ -1122,4 +1530,5 @@ struct EvalResult {
     pending_lsp_items: Vec<LspResolveItem>,
     unknown_external_generic_calls: usize,
     total_external_generic_calls: usize,
+    uninstalled_external_calls: usize,
 }

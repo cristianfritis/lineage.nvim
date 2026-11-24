@@ -1,0 +1,154 @@
+*lineage.txt*   Demand-driven interprocedural dataflow slicing for Neovim
+
+==============================================================================
+CONTENTS                                                    *lineage-contents*
+
+  1. Introduction .......................... |lineage-intro|
+  2. Installation .......................... |lineage-install|
+  3. Commands .............................. |lineage-commands|
+  4. Configuration ......................... |lineage-config|
+  5. Keymaps & UI .......................... |lineage-keymaps|
+  6. Health & Troubleshooting .............. |lineage-health|
+  7. v1 Scope Boundaries ................... |lineage-scope|
+
+==============================================================================
+1. INTRODUCTION                                                *lineage-intro*
+
+`lineage.nvim` connects Neovim (`>= 0.10`) to the `lineage-engine` Rust
+sidecar to perform demand-driven, flow-sensitive nullability and dataflow
+slicing across TypeScript/TSX/JavaScript, Python, and Rust.
+
+==============================================================================
+2. INSTALLATION                                              *lineage-install*
+
+Recommended `lazy.nvim` spec: >lua
+  {
+    "cristianfritis/lineage.nvim",
+    build = function()
+      require("lineage.install").install()
+    end,
+    config = function()
+      require("lineage").setup()
+    end,
+  }
+<
+`:Lineage install` (`:Lineage install!` to force) reads `checksums.json` from the
+plugin repository, downloads the matching prebuilt binary from the pinned
+`engine-v*` GitHub Release URL (without calling the GitHub REST API), verifies
+its SHA-256 digest, stops any running sidecar, and atomically installs into:
+  `stdpath('data')/lineage/bin/lineage-engine-<engine_tag>`
+
+If no prebuilt binary or published digest is available for the current target,
+`build_from_source = true` is configured, or a network download fails while
+`cargo` is on `PATH`, the installer falls back to `cargo build --release`
+inside `engine/` and writes `<dest>.source_build` (removed when a verified
+prebuilt binary is installed). SHA-256 mismatches always abort with an error.
+
+==============================================================================
+3. COMMANDS                                                 *lineage-commands*
+
+:Lineage [subcommand]
+  Without arguments, opens Two-Phase Hover (`:Lineage hover`).
+
+  Subcommands:
+    hover         Open Two-Phase Hover dataflow card at cursor
+    focus         Toggle Inline Focus Mode for symbol under cursor
+    pin           Pin Inline Focus Mode across buffer switches
+    clear         Clear Focus / Pin highlights and autocmds
+    to            Open Interactive Tree Panel (Data Flow To Here)
+    from          Open Interactive Tree Panel (Data Flow From Here)
+    both          Open Interactive Tree Panel (bidirectional)
+    back          Pop the Lineage jump stack
+    install       Download/verify prebuilt binary or build with Cargo
+    install!      Force re-install of pinned lineage-engine binary
+    status        Open scratch buffer with sidecar status metrics
+    log           Open scratch buffer with sidecar stderr ring buffer
+    debug-dump    Dump lowered Pruned SSI IR for the current buffer
+
+==============================================================================
+4. CONFIGURATION                                              *lineage-config*
+
+Call `require("lineage").setup(opts)` with any overrides to these defaults: >lua
+  require("lineage").setup({
+    binary_path = nil,
+    version = nil,
+    build_from_source = false,
+    hover = {
+      enter_on_open = true,
+      border = "rounded",
+      max_width = 80,
+      max_height = 24,
+      icons = { unicode = true },
+      keymaps = {
+        jump_cursor = "<CR>",
+        jump_prefix = "g",
+        toggle_unverified = "gu",
+        close = { "q", "<Esc>" },
+      },
+    },
+    lsp = { timeout_ms = 150 },
+    tree = { height = 14 },
+    exclude_tests = false,
+  })
+<
+==============================================================================
+5. KEYMAPS & UI                                              *lineage-keymaps*
+
+Plug Mappings:
+  <Plug>(LineageHover)      Open Two-Phase Hover
+  <Plug>(LineageFocus)      Toggle Inline Focus Mode
+  <Plug>(LineagePin)        Pin Inline Focus Mode
+  <Plug>(LineageTo)         Open Tree Panel (to)
+  <Plug>(LineageFrom)       Open Tree Panel (from)
+  <Plug>(LineageBack)       Jump back in Lineage stack
+
+Two-Phase Hover Keymaps:
+  <CR>                      Jump to origin on cursor line
+  g1 .. g9                  Jump to numbered origin [1]..[9]
+  gu                        Toggle Unverified Boundaries section
+  gs                        Switch to Inline Focus Mode
+  gp                        Pin Inline Focus Mode
+  gt / gf / gn              Open Tree Panel (to / from / both)
+  q / <Esc>                 Close hover and restore cursor
+
+Interactive Tree Panel Keymaps:
+  <CR>                      Expand frontier [+] or jump to location
+  o                         Expand frontier or toggle fold
+  g                         Toggle grouping (Root Origin / Nullability)
+  n                         Toggle Null-only filter
+  t                         Toggle Exclude-tests filter
+  m                         Cycle direction (to -> from -> both)
+  q / <Esc>                 Close tree and preview window
+
+Coverage-Honesty Indicators:
+  NonNull                   Proven present on reachable paths
+  Nullable                  May be null/absent along at least one path
+  Absent ([NULL])           Directly null, absent, or uninitialized
+  Unverified ([?])          Unresolved dynamic/external boundary
+  [partial]                 Tree view capped by traversal budget
+
+==============================================================================
+6. HEALTH & TROUBLESHOOTING                                   *lineage-health*
+
+Run `:checkhealth lineage` to verify:
+  - Neovim version (`>= 0.10`)
+  - Discovered `lineage-engine` binary path and install source
+    (recommends `:Lineage install` when missing)
+  - Sidecar ping latency, protocol version, loaded grammars, LRU cache usage,
+    EWMA / circuit-breaker state, and rotating log path
+  - Attached LSP clients (`offset_encoding` and capabilities)
+
+Standalone CLI diagnostics (outside Neovim):
+  lineage-engine dump-ir <file>
+  lineage-engine dump-cfg --dot <file>
+  lineage-engine slice <file>:<line>:<col> --format json --trace
+
+==============================================================================
+7. v1 SCOPE BOUNDARIES                                         *lineage-scope*
+
+- Languages: TypeScript/TSX/JavaScript, Python, and Rust in v1.
+- Prebuilt targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
+  `aarch64-apple-darwin`, `x86_64-apple-darwin`. Other targets use Cargo.
+- No Mason registry integration and no background auto-updates in v1.
+
+vim:tw=78:ts=8:ft=help:norl:

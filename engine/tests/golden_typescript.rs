@@ -53,6 +53,7 @@ fn slice_at_cursor(ext: &str, marked_src: &str) -> SliceEnvelope {
                 lsp_attached: false,
                 lsp_client_name: None,
                 workspace_root: None,
+                lsp_timeout_ms: None,
             },
             "golden",
             &AtomicBool::new(false),

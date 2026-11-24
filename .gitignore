@@ -1,7 +1,14 @@
 .agents/
 .pi/
+.tmp/
 engine/target/
 *.log
+.dogfood-cache/
+benchmarks/reports/
+doc/tags
+*_report.md
+design_draft.md
+concepts_brief.md
 
 
 

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -22,12 +23,17 @@ jobs:
       - name: Cargo fmt check
         working-directory: engine
         run: cargo fmt --check
+      - name: Cargo check mimalloc
+        working-directory: engine
+        run: cargo check --features mimalloc
 
   neovim:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        nvim-version: ["v0.10.4", "v0.11.0"]
+        nvim-version: ["v0.10.4", "v0.11.0", "nightly"]
+    continue-on-error: ${{ matrix.nvim-version == 'nightly' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,6 +49,18 @@ jobs:
         uses: JohnnyMorganz/stylua-action@v4
         with:
           args: --check plugin lua tests
+      - name: Validate checksums.json on release tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python3 - <<'PY'
+          import json, re
+          data = json.load(open("checksums.json"))
+          for t, e in data["targets"].items():
+              sha = e.get("sha256", "")
+              if not re.fullmatch(r"[0-9a-f]{64}", sha):
+                  raise SystemExit(f"Invalid or TBD sha256 for {t} on release tag: {sha!r}")
+          print("checksums.json verified for release tag")
+          PY
       - name: Run headless Neovim tests
         run: |
           for t in tests/test_*.lua; do

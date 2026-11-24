@@ -190,6 +190,8 @@ pub struct SliceParams {
     pub lsp_client_name: Option<String>,
     #[serde(default)]
     pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub lsp_timeout_ms: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -241,6 +243,7 @@ pub enum UnknownReason {
     TreeSitterErrorNode,
     PolymorphicCap,
     MaxDepth,
+    ExternalUninstalled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -431,6 +434,8 @@ pub struct SliceStats {
     pub contracted_chains: usize,
     pub unknown_external_generic_calls: usize,
     pub total_external_generic_calls: usize,
+    #[serde(default)]
+    pub uninstalled_external_calls: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,6 +486,10 @@ pub struct LspResolveBatchParams {
     pub depth: u32,
     pub timeout_ms: u64,
     pub items: Vec<LspResolveItem>,
+    #[serde(default)]
+    pub circuit_open_clients: Vec<String>,
+    #[serde(default)]
+    pub max_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,4 +545,6 @@ pub struct StatusResult {
     pub ewma_clients: Vec<ClientHealthSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_bytes: Option<u64>,
 }

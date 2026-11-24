@@ -7,8 +7,8 @@ use crate::adapters::python::stub_extract::classify_py_type_text;
 use crate::ir::guards::GuardFact;
 use crate::ir::{
     AbsenceValue, BasicBlock, BlockId, CallTarget, DangerSink, DangerSinkKind, ExitEdge,
-    FileSkeleton, FnSummary, FunctionIr, FunctionSkeleton, ImportSpec, SsiInst, SsiOp,
-    ValueId, STATE_NULL, STATE_PRESENT,
+    FileSkeleton, FnSummary, FunctionIr, FunctionSkeleton, ImportSpec, SsiInst, SsiOp, ValueId,
+    STATE_NULL, STATE_PRESENT,
 };
 use crate::protocol::schema::{CanonicalRange, UnknownReason};
 use crate::text::PositionMapper;
@@ -348,7 +348,11 @@ struct PyLowerer<'a> {
 }
 
 impl<'a> PyLowerer<'a> {
-    fn new(src: &'a [u8], mapper: &'a PositionMapper, imports: HashMap<String, ImportSpec>) -> Self {
+    fn new(
+        src: &'a [u8],
+        mapper: &'a PositionMapper,
+        imports: HashMap<String, ImportSpec>,
+    ) -> Self {
         let entry = BasicBlock {
             id: BlockId(0),
             preds: Vec::new(),
@@ -402,10 +406,15 @@ impl<'a> PyLowerer<'a> {
         let range = self
             .mapper
             .byte_range_to_canonical(node.start_byte(), node.end_byte());
-        let snippet = node
-            .utf8_text(self.src)
-            .ok()
-            .map(|s| s.lines().next().unwrap_or("").trim().chars().take(80).collect());
+        let snippet = node.utf8_text(self.src).ok().map(|s| {
+            s.lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(80)
+                .collect()
+        });
         self.insts.push(SsiInst {
             id,
             block: self.cur_block,
@@ -582,9 +591,13 @@ impl<'a> PyLowerer<'a> {
                 for ch in node.named_children(&mut c) {
                     if ch.kind() == "block" {
                         self.lower_block_children(ch);
-                    } else if matches!(ch.kind(), "except_clause" | "else_clause" | "finally_clause")
-                    {
-                        if let Some(b) = ch.named_children(&mut ch.walk()).find(|n| n.kind() == "block")
+                    } else if matches!(
+                        ch.kind(),
+                        "except_clause" | "else_clause" | "finally_clause"
+                    ) {
+                        if let Some(b) = ch
+                            .named_children(&mut ch.walk())
+                            .find(|n| n.kind() == "block")
                         {
                             self.lower_block_children(b);
                         }
@@ -790,7 +803,8 @@ impl<'a> PyLowerer<'a> {
                     if let Some(var_name) = l_target {
                         if r_text == "None" {
                             let is_not_none = text.contains("is not") || text.contains("!=");
-                            let is_eq_none = !is_not_none && (text.contains("is") || text.contains("=="));
+                            let is_eq_none =
+                                !is_not_none && (text.contains("is") || text.contains("=="));
                             if is_not_none {
                                 let mask = if is_then { STATE_PRESENT } else { STATE_NULL };
                                 facts.push((
@@ -840,8 +854,16 @@ impl<'a> PyLowerer<'a> {
                     label: "None".to_string(),
                 },
             ),
-            "true" | "false" | "integer" | "float" | "string" | "concatenated_string" | "list"
-            | "dictionary" | "set" | "tuple" => self.emit(
+            "true"
+            | "false"
+            | "integer"
+            | "float"
+            | "string"
+            | "concatenated_string"
+            | "list"
+            | "dictionary"
+            | "set"
+            | "tuple" => self.emit(
                 None,
                 node,
                 SsiOp::Const {
@@ -1118,7 +1140,10 @@ impl<'a> PyLowerer<'a> {
                                     let narrowed = self.emit(
                                         Some(place.clone()),
                                         cond,
-                                        SsiOp::Pi { src: orig, guard: fact },
+                                        SsiOp::Pi {
+                                            src: orig,
+                                            guard: fact,
+                                        },
                                     );
                                     self.env.insert(place, narrowed);
                                 }
@@ -1230,6 +1255,8 @@ impl<'a> PyLowerer<'a> {
 
     fn finish(mut self, skeleton: &FunctionSkeleton) -> FunctionIr {
         self.span_index.sort_by_key(|(r, _)| (r.start, r.end));
+        let param_flow_to_return =
+            crate::ir::compute_param_flow_to_return(&self.insts, &self.returns);
         FunctionIr {
             symbol_id: skeleton.symbol_id.clone(),
             name: skeleton.name.clone(),
@@ -1241,12 +1268,8 @@ impl<'a> PyLowerer<'a> {
             danger_sinks: self.danger_sinks,
             span_index: self.span_index,
             local_summary: FnSummary {
-                return_absence: if self.return_absence == AbsenceValue::bottom() {
-                    AbsenceValue::present()
-                } else {
-                    self.return_absence
-                },
-                param_flow_to_return: Vec::new(),
+                return_absence: self.return_absence,
+                param_flow_to_return,
                 symbolic_callees: self.symbolic_callees,
             },
         }

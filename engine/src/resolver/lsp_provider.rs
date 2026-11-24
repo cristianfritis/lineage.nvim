@@ -14,11 +14,30 @@ pub const DEFAULT_LSP_TIMEOUT_MS: u64 = 150;
 pub const PHASE2_CEILING_MS: u64 = 250;
 pub const MAX_IMPLEMENTATION_TARGETS: usize = 5;
 
-pub type ReverseRpcSender =
-    Arc<dyn Fn(LspResolveBatchParams) -> Result<LspResolveBatchResult, String> + Send + Sync>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReverseRpcError {
+    Timeout,
+    Cancelled,
+    Other(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResolveContext {
+    pub workspace_root: Option<String>,
+    pub lsp_client_name: Option<String>,
+}
+
+pub type ReverseRpcSender = Arc<
+    dyn Fn(LspResolveBatchParams) -> Result<LspResolveBatchResult, ReverseRpcError> + Send + Sync,
+>;
 
 pub trait SymbolResolver: Send + Sync {
-    fn resolve_batch(&self, params: LspResolveBatchParams, now: Instant) -> LspResolveBatchResult;
+    fn resolve_batch(
+        &self,
+        params: LspResolveBatchParams,
+        ctx: &ResolveContext,
+        now: Instant,
+    ) -> LspResolveBatchResult;
 
     fn ewma_tracker(&self) -> Option<&EwmaTracker> {
         None
@@ -28,7 +47,12 @@ pub trait SymbolResolver: Send + Sync {
 pub struct NullLspProvider;
 
 impl SymbolResolver for NullLspProvider {
-    fn resolve_batch(&self, params: LspResolveBatchParams, _now: Instant) -> LspResolveBatchResult {
+    fn resolve_batch(
+        &self,
+        params: LspResolveBatchParams,
+        _ctx: &ResolveContext,
+        _now: Instant,
+    ) -> LspResolveBatchResult {
         LspResolveBatchResult {
             results: params
                 .items
@@ -75,44 +99,40 @@ impl SymbolResolver for StdioLspProvider {
     fn resolve_batch(
         &self,
         mut params: LspResolveBatchParams,
+        ctx: &ResolveContext,
         now: Instant,
     ) -> LspResolveBatchResult {
+        let workspace_root = ctx
+            .workspace_root
+            .clone()
+            .unwrap_or_else(|| self.workspace_root.clone());
+        let client_name = ctx
+            .lsp_client_name
+            .clone()
+            .unwrap_or_else(|| self.default_client.clone());
         let key = ClientHealthKey {
-            client_name: self.default_client.clone(),
-            workspace_root: self.workspace_root.clone(),
+            client_name: client_name.clone(),
+            workspace_root: workspace_root.clone(),
         };
-        if self.ewma.check_circuit(&key, now) == CircuitState::Open {
-            return LspResolveBatchResult {
-                results: params
-                    .items
-                    .into_iter()
-                    .map(|item| LspResolveItemResult {
-                        key: item.key,
-                        locations: Vec::new(),
-                        timed_out: false,
-                        unattached: false,
-                        circuit_open: true,
-                        client_name: Some(self.default_client.clone()),
-                        offset_encoding: None,
-                        latency_ms: 0,
-                    })
-                    .collect(),
-            };
-        }
 
+        params.circuit_open_clients = self.ewma.open_clients_for_workspace(&workspace_root, now);
+        let max_ms = params.max_timeout_ms.unwrap_or(DEFAULT_LSP_TIMEOUT_MS);
         if params.timeout_ms == 0 {
-            params.timeout_ms = self.ewma.suggested_timeout_ms(&key, DEFAULT_LSP_TIMEOUT_MS);
+            params.timeout_ms = self.ewma.suggested_timeout_ms(&key, max_ms).min(max_ms);
+        } else {
+            params.timeout_ms = params.timeout_ms.min(max_ms);
         }
 
         match (self.sender)(params.clone()) {
             Ok(res) => {
                 for item in &res.results {
+                    let item_client = item
+                        .client_name
+                        .clone()
+                        .unwrap_or_else(|| client_name.clone());
                     let client_key = ClientHealthKey {
-                        client_name: item
-                            .client_name
-                            .clone()
-                            .unwrap_or_else(|| self.default_client.clone()),
-                        workspace_root: self.workspace_root.clone(),
+                        client_name: item_client,
+                        workspace_root: workspace_root.clone(),
                     };
                     if item.timed_out {
                         self.ewma.record_timeout(&client_key, now);
@@ -123,7 +143,10 @@ impl SymbolResolver for StdioLspProvider {
                 }
                 res
             }
-            Err(_) => {
+            Err(ReverseRpcError::Cancelled) => LspResolveBatchResult {
+                results: Vec::new(),
+            },
+            Err(ReverseRpcError::Timeout) | Err(ReverseRpcError::Other(_)) => {
                 self.ewma.record_timeout(&key, now);
                 LspResolveBatchResult {
                     results: params
@@ -135,7 +158,7 @@ impl SymbolResolver for StdioLspProvider {
                             timed_out: true,
                             unattached: false,
                             circuit_open: false,
-                            client_name: Some(self.default_client.clone()),
+                            client_name: Some(client_name.clone()),
                             offset_encoding: None,
                             latency_ms: params.timeout_ms,
                         })
@@ -205,7 +228,12 @@ impl FixtureLspProvider {
 }
 
 impl SymbolResolver for FixtureLspProvider {
-    fn resolve_batch(&self, params: LspResolveBatchParams, now: Instant) -> LspResolveBatchResult {
+    fn resolve_batch(
+        &self,
+        params: LspResolveBatchParams,
+        _ctx: &ResolveContext,
+        now: Instant,
+    ) -> LspResolveBatchResult {
         let mut results = Vec::with_capacity(params.items.len());
         for item in params.items {
             let matching = self.rules.get(&item.key);
@@ -293,5 +321,133 @@ impl SymbolResolver for FixtureLspProvider {
 
     fn ewma_tracker(&self) -> Option<&EwmaTracker> {
         Some(&self.ewma)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ewma_isolates_client_and_workspace_and_clamps_max_timeout() {
+        let ewma = Arc::new(EwmaTracker::new());
+        let seen_batches = Arc::new(std::sync::Mutex::new(Vec::<LspResolveBatchParams>::new()));
+        let seen_clone = Arc::clone(&seen_batches);
+        let sender: ReverseRpcSender = Arc::new(move |params| {
+            seen_clone.lock().unwrap().push(params.clone());
+            Ok(LspResolveBatchResult {
+                results: params
+                    .items
+                    .iter()
+                    .map(|it| LspResolveItemResult {
+                        key: it.key.clone(),
+                        locations: Vec::new(),
+                        timed_out: true,
+                        unattached: false,
+                        circuit_open: false,
+                        client_name: Some("vtsls".to_string()),
+                        offset_encoding: None,
+                        latency_ms: 100,
+                    })
+                    .collect(),
+            })
+        });
+
+        let provider = StdioLspProvider::new(
+            sender,
+            Arc::clone(&ewma),
+            "/ws_default".to_string(),
+            "ts_ls".to_string(),
+        );
+        let t0 = Instant::now();
+        let make_batch = || LspResolveBatchParams {
+            query_id: 1,
+            trace_id: "t1".to_string(),
+            depth: 1,
+            timeout_ms: 0,
+            items: vec![crate::protocol::schema::LspResolveItem {
+                key: "foo".to_string(),
+                uri: "file:///ws1/a.ts".to_string(),
+                position: crate::protocol::schema::LspPosition {
+                    line: 0,
+                    character: 0,
+                },
+                offset_encoding: OffsetEncoding::Utf16,
+                kind: LspResolveKind::Definition,
+            }],
+            circuit_open_clients: Vec::new(),
+            max_timeout_ms: Some(120),
+        };
+
+        let ctx_ws1_vtsls = ResolveContext {
+            workspace_root: Some("/ws1".to_string()),
+            lsp_client_name: Some("vtsls".to_string()),
+        };
+        for _ in 0..3 {
+            provider.resolve_batch(make_batch(), &ctx_ws1_vtsls, t0);
+        }
+
+        // Now vtsls in /ws1 has circuit open, but ts_ls in /ws1 and vtsls in /ws2 do not.
+        let ctx_ws1_tsls = ResolveContext {
+            workspace_root: Some("/ws1".to_string()),
+            lsp_client_name: Some("ts_ls".to_string()),
+        };
+        provider.resolve_batch(make_batch(), &ctx_ws1_tsls, t0);
+
+        let ctx_ws2_vtsls = ResolveContext {
+            workspace_root: Some("/ws2".to_string()),
+            lsp_client_name: Some("vtsls".to_string()),
+        };
+        provider.resolve_batch(make_batch(), &ctx_ws2_vtsls, t0);
+
+        let batches = seen_batches.lock().unwrap();
+        assert_eq!(batches[3].circuit_open_clients, vec!["vtsls".to_string()]);
+        assert!(batches[4].circuit_open_clients.is_empty());
+        assert!(batches[3].timeout_ms <= 120);
+    }
+
+    #[test]
+    fn cancelled_reverse_rpc_does_not_trip_ewma_timeout() {
+        let ewma = Arc::new(EwmaTracker::new());
+        let sender: ReverseRpcSender = Arc::new(|_| Err(ReverseRpcError::Cancelled));
+        let provider = StdioLspProvider::new(
+            sender,
+            Arc::clone(&ewma),
+            "/ws".to_string(),
+            "vtsls".to_string(),
+        );
+        let ctx = ResolveContext {
+            workspace_root: Some("/ws".to_string()),
+            lsp_client_name: Some("vtsls".to_string()),
+        };
+        let batch = LspResolveBatchParams {
+            query_id: 7,
+            trace_id: "t7".to_string(),
+            depth: 1,
+            timeout_ms: 0,
+            items: vec![crate::protocol::schema::LspResolveItem {
+                key: "bar".to_string(),
+                uri: "file:///ws/a.ts".to_string(),
+                position: crate::protocol::schema::LspPosition {
+                    line: 0,
+                    character: 0,
+                },
+                offset_encoding: OffsetEncoding::Utf16,
+                kind: LspResolveKind::Definition,
+            }],
+            circuit_open_clients: Vec::new(),
+            max_timeout_ms: Some(150),
+        };
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            let res = provider.resolve_batch(batch.clone(), &ctx, t0);
+            assert!(res.results.is_empty());
+        }
+        let key = ClientHealthKey {
+            client_name: "vtsls".to_string(),
+            workspace_root: "/ws".to_string(),
+        };
+        assert_eq!(ewma.check_circuit(&key, t0), CircuitState::Closed);
+        assert!(ewma.open_clients_for_workspace("/ws", t0).is_empty());
     }
 }

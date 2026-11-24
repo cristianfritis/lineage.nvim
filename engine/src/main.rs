@@ -2,6 +2,10 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+#[cfg(all(target_env = "musl", feature = "mimalloc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 use tracing_appender::rolling;
 use tracing_subscriber::fmt;
@@ -29,9 +33,10 @@ fn init_logging(log_dir: Option<&PathBuf>) -> Option<String> {
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     // Leak guard for process lifetime so rotating logs flush on exit.
     Box::leak(Box::new(guard));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt()
         .with_writer(non_blocking)
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(env_filter)
         .with_ansi(false)
         .try_init();
     Some(dir.join("lineage-engine.log").to_string_lossy().to_string())
@@ -159,6 +164,7 @@ fn main() {
                 lsp_attached: false,
                 lsp_client_name: None,
                 workspace_root: file.parent().map(|p| p.to_string_lossy().to_string()),
+                lsp_timeout_ms: None,
             };
             let cancel = AtomicBool::new(false);
             match engine.slice_query(&params, "cli-1", &cancel, None::<fn(_)>) {

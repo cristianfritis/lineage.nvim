@@ -186,13 +186,11 @@ fn collect_call_sites(
     out: &mut Vec<CallerSite>,
 ) {
     let current_fn_owned: Option<String> = match node.kind() {
-        "function_declaration"
-        | "method_definition"
-        | "function_definition"
-        | "function_item" => node
-            .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(bytes).ok())
-            .map(|s| s.to_string()),
+        "function_declaration" | "method_definition" | "function_definition" | "function_item" => {
+            node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .map(|s| s.to_string())
+        }
         _ => None,
     };
     let active_fn = current_fn_owned.as_deref().unwrap_or(enclosing_fn);
@@ -228,10 +226,7 @@ fn collect_call_sites(
             if matched {
                 let start = node.start_position();
                 let end = node.end_position();
-                let line_snippet = source
-                    .lines()
-                    .nth(start.row)
-                    .map(|l| l.trim().to_string());
+                let line_snippet = source.lines().nth(start.row).map(|l| l.trim().to_string());
                 out.push(CallerSite {
                     path: path.to_path_buf(),
                     uri: uri.to_string(),
@@ -420,13 +415,8 @@ pub fn discover_callers_with_limits(
                 return WalkState::Continue;
             };
 
-            let sites = verify_call_sites_with_treesitter(
-                ext,
-                source,
-                &target_symbol,
-                path,
-                test_file,
-            );
+            let sites =
+                verify_call_sites_with_treesitter(ext, source, &target_symbol, path, test_file);
             if !sites.is_empty() {
                 results.lock().expect("results lock").extend(sites);
             }

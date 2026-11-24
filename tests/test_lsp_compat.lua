@@ -79,21 +79,25 @@ end
 
 local fb_done = false
 local fb_res = nil
-lsp_compat.resolve_batch({
-  query_id = 3,
-  timeout_ms = 200,
-  items = {
-    {
-      key = "findSession",
-      uri = uri,
-      position = { line = 0, character = 16 },
-      kind = "callHierarchyIncoming",
+lsp_compat.resolve_batch(
+  {
+    query_id = 3,
+    timeout_ms = 200,
+    items = {
+      {
+        key = "findSession",
+        uri = uri,
+        position = { line = 0, character = 16 },
+        kind = "callHierarchyIncoming",
+      },
     },
   },
-}, nil, function(res)
-  fb_res = res
-  fb_done = true
-end)
+  nil,
+  function(res)
+    fb_res = res
+    fb_done = true
+  end
+)
 
 assert(
   vim.wait(1000, function()
@@ -101,8 +105,14 @@ assert(
   end, 10),
   "callHierarchyIncoming fallback timed out"
 )
-assert(methods_called[1] == "textDocument/prepareCallHierarchy", "Expected prepareCallHierarchy first")
-assert(methods_called[2] == "textDocument/references", "Expected fallback to textDocument/references")
+assert(
+  methods_called[1] == "textDocument/prepareCallHierarchy",
+  "Expected prepareCallHierarchy first"
+)
+assert(
+  methods_called[2] == "textDocument/references",
+  "Expected fallback to textDocument/references"
+)
 assert(#fb_res.results[1].locations == 1, "Expected 1 fallback location")
 assert(fb_res.results[1].locations[1].uri == "file:///tmp/caller.ts")
 

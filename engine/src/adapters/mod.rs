@@ -20,7 +20,13 @@ pub trait LanguageAdapter: Send + Sync {
 
     fn parse_skeleton(&self, uri: &str, source: &str) -> FileSkeleton;
 
-    fn lower_function(&self, uri: &str, source: &str, skeleton: &FunctionSkeleton) -> FunctionIr;
+    fn lower_function(
+        &self,
+        uri: &str,
+        source: &str,
+        file_skeleton: &FileSkeleton,
+        skeleton: &FunctionSkeleton,
+    ) -> FunctionIr;
 
     fn extract_declaration_signature(
         &self,
@@ -88,7 +94,13 @@ impl LanguageAdapter for StubAdapter {
         }
     }
 
-    fn lower_function(&self, _uri: &str, _source: &str, skeleton: &FunctionSkeleton) -> FunctionIr {
+    fn lower_function(
+        &self,
+        _uri: &str,
+        _source: &str,
+        _file_skeleton: &FileSkeleton,
+        skeleton: &FunctionSkeleton,
+    ) -> FunctionIr {
         let v0 = ValueId(0);
         FunctionIr {
             symbol_id: skeleton.symbol_id.clone(),

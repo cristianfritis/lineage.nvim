@@ -1,0 +1,187 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "engine-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and smoke-test all targets without publishing a GitHub Release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      engine_tag: ${{ steps.meta.outputs.engine_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Cargo.toml version and tag parity
+        id: meta
+        shell: bash
+        run: |
+          CARGO_VER="$(python3 -c 'import tomllib; print(tomllib.load(open("engine/Cargo.toml", "rb"))["package"]["version"])')"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            TAG_VER="${TAG#engine-v}"
+            if [[ "${TAG_VER}" != "${CARGO_VER}" ]]; then
+              echo "::error::Tag ${TAG} (${TAG_VER}) does not match engine/Cargo.toml (${CARGO_VER})"
+              exit 1
+            fi
+          else
+            TAG="engine-v${CARGO_VER}"
+          fi
+          echo "version=${CARGO_VER}" >> "$GITHUB_OUTPUT"
+          echo "engine_tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            features: "--features mimalloc"
+            musl: true
+            cc: musl-gcc
+            native_smoke: true
+            darwin: false
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            features: "--features mimalloc"
+            musl: true
+            cc: musl-gcc
+            native_smoke: true
+            darwin: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            features: ""
+            musl: false
+            cc: ""
+            native_smoke: true
+            darwin: true
+          - target: x86_64-apple-darwin
+            os: macos-14
+            features: ""
+            musl: false
+            cc: ""
+            native_smoke: false
+            darwin: true
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        working-directory: engine
+        env:
+          CC_x86_64_unknown_linux_musl: ${{ matrix.cc }}
+          CC_aarch64_unknown_linux_musl: ${{ matrix.cc }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+
+      - name: Smoke-test binary
+        shell: bash
+        run: |
+          BIN="engine/target/${{ matrix.target }}/release/lineage-engine"
+          file "$BIN"
+          if [[ "${{ matrix.musl }}" == "true" ]]; then
+            LDD_OUT="$(ldd "$BIN" 2>&1 || true)"
+            echo "$LDD_OUT"
+            if ! echo "$LDD_OUT" | grep -qiE "not a dynamic executable|statically linked"; then
+              echo "::error::Expected static musl binary"
+              exit 1
+            fi
+          fi
+          if [[ "${{ matrix.darwin }}" == "true" ]]; then
+            lipo -archs "$BIN"
+          fi
+          if [[ "${{ matrix.native_smoke }}" == "true" ]]; then
+            "$BIN" --version
+            TMP_SMOKE="$(mktemp -d)"
+            printf 'function f() { const x = null; return x; }\n' > "$TMP_SMOKE/sample.ts"
+            "$BIN" dump-ir "$TMP_SMOKE/sample.ts" >/dev/null
+            "$BIN" slice "$TMP_SMOKE/sample.ts:1:20" --format json >/dev/null
+            rm -rf "$TMP_SMOKE"
+          fi
+
+      - name: Stage release artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "engine/target/${{ matrix.target }}/release/lineage-engine" "dist/lineage-engine-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lineage-engine-${{ matrix.target }}
+          path: dist/lineage-engine-${{ matrix.target }}
+
+  release:
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect binaries and generate deterministic checksums.json
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          VERSION="${{ needs.metadata.outputs.version }}"
+          ENGINE_TAG="${{ needs.metadata.outputs.engine_tag }}"
+          TRIPLES=(
+            "x86_64-unknown-linux-musl"
+            "aarch64-unknown-linux-musl"
+            "aarch64-apple-darwin"
+            "x86_64-apple-darwin"
+          )
+          TARGETS_JSON=""
+          for triple in "${TRIPLES[@]}"; do
+            asset="lineage-engine-${triple}"
+            cp "artifacts/${asset}/${asset}" "release-assets/${asset}"
+            sha="$(sha256sum "release-assets/${asset}" | awk '{print $1}')"
+            if [ -n "$TARGETS_JSON" ]; then
+              TARGETS_JSON="${TARGETS_JSON},"
+            fi
+            TARGETS_JSON="${TARGETS_JSON}
+              \"${triple}\": {
+                \"asset\": \"${asset}\",
+                \"sha256\": \"${sha}\"
+              }"
+          done
+
+          cat > release-assets/checksums.json <<EOF
+          {
+            "version": "${VERSION}",
+            "engine_tag": "${ENGINE_TAG}",
+            "repo": "${GITHUB_REPOSITORY}",
+            "targets": {${TARGETS_JSON}
+            }
+          }
+          EOF
+          cat release-assets/checksums.json
+
+      - name: Publish GitHub Release
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          make_latest: false
+          generate_release_notes: true

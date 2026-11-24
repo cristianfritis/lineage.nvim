@@ -9,9 +9,7 @@ use lineage_engine::cache::{DirtyBufferOverlay, FileIrCache};
 use lineage_engine::protocol::schema::{
     LspPosition, OffsetEncoding, SliceDirection, SliceEnvelope, SliceParams, TruncationReason,
 };
-use lineage_engine::resolver::{
-    discover_callers, discover_callers_with_limits, NullLspProvider,
-};
+use lineage_engine::resolver::{discover_callers, discover_callers_with_limits, NullLspProvider};
 use lineage_engine::slicer::SlicerEngine;
 
 fn temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -98,20 +96,15 @@ fn test_ripgrep_cap_truncation_emits_partial() {
         let p = dir.join(format!("c{i}.ts"));
         fs::write(
             &p,
-            format!("import {{ ping }} from './mod';\nexport function f{i}() {{ return ping(); }}\n"),
+            format!(
+                "import {{ ping }} from './mod';\nexport function f{i}() {{ return ping(); }}\n"
+            ),
         )
         .unwrap();
     }
 
-    let res = discover_callers_with_limits(
-        &dir,
-        "ping",
-        &target,
-        false,
-        3,
-        300,
-        Duration::from_secs(2),
-    );
+    let res =
+        discover_callers_with_limits(&dir, "ping", &target, false, 3, 300, Duration::from_secs(2));
     assert_eq!(res.truncated, Some(TruncationReason::MaxNodes));
     assert!(res.walked_files <= 3);
 
@@ -137,12 +130,7 @@ fn test_from_slice_cold_scan_cache_isolation_and_projections() {
     let cache = Arc::new(FileIrCache::new(1024 * 1024));
     let dirty = Arc::new(DirtyBufferOverlay::new());
     let adapters: Vec<Arc<dyn LanguageAdapter>> = vec![Arc::new(TypeScriptAdapter::new())];
-    let engine = SlicerEngine::new(
-        cache.clone(),
-        dirty,
-        Arc::new(NullLspProvider),
-        adapters,
-    );
+    let engine = SlicerEngine::new(cache.clone(), dirty, Arc::new(NullLspProvider), adapters);
 
     let target_uri = format!("file://{}", target.to_string_lossy());
     let caller_uri = format!("file://{}", caller.to_string_lossy());
@@ -167,6 +155,7 @@ fn test_from_slice_cold_scan_cache_isolation_and_projections() {
                 lsp_attached: false,
                 lsp_client_name: None,
                 workspace_root: Some(dir.to_string_lossy().to_string()),
+                lsp_timeout_ms: None,
             },
             "tr-1",
             &cancel,

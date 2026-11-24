@@ -84,8 +84,9 @@ function M.render_spans(bufnr, spans, opts)
 
   local relevant_by_line = {}
   for _, span in ipairs(spans or {}) do
-    local same_file = (span.file_id == 0 and (not span.uri or span.uri == "" or span.uri == target_uri))
-      or (target_uri and span.uri == target_uri)
+    local same_file = (
+      span.file_id == 0 and (not span.uri or span.uri == "" or span.uri == target_uri)
+    ) or (target_uri and span.uri == target_uri)
     if same_file and span.range and span.range.start then
       local lnum = span.range.start.line
       if not relevant_by_line[lnum] then
@@ -149,6 +150,9 @@ end
 
 function M.clear()
   stop_debounce()
+  if state.query_id > 0 then
+    client.cancel_query(state.query_id)
+  end
   if state.augroup then
     pcall(vim.api.nvim_del_augroup_by_id, state.augroup)
     state.augroup = nil
@@ -217,8 +221,11 @@ local function setup_autocmds()
 end
 
 local function fetch_and_render(bufnr, uri, pos)
-  state.query_id = state.query_id + 1
-  local qid = state.query_id
+  if state.query_id > 0 then
+    client.cancel_query(state.query_id)
+  end
+  local qid = client.next_query_id()
+  state.query_id = qid
 
   client.ensure_started(function(err)
     if err or qid ~= state.query_id then
@@ -230,7 +237,8 @@ local function fetch_and_render(bufnr, uri, pos)
 
     sync.sync_if_dirty(bufnr, client)
     local clients = lsp_compat.get_clients(bufnr)
-    local primary_client = clients[1]
+    local primary_client = lsp_compat.pick_client(bufnr, "textDocument/definition") or clients[1]
+    local cfg = config.get()
 
     client.request("lineage/slice", {
       uri = uri,
@@ -241,17 +249,21 @@ local function fetch_and_render(bufnr, uri, pos)
       include_focus = true,
       include_tree = false,
       include_snippets = false,
-      exclude_tests = config.get().exclude_tests or false,
+      exclude_tests = cfg.exclude_tests or false,
       query_id = qid,
       lsp_attached = #clients > 0,
       lsp_client_name = primary_client and primary_client.name or nil,
+      lsp_timeout_ms = cfg.lsp and cfg.lsp.timeout_ms or 150,
       workspace_root = vim.fn.getcwd(),
     }, function(req_err, res)
       if qid ~= state.query_id or not state.active then
         return
       end
       if req_err then
-        vim.notify("lineage.nvim: " .. (req_err.message or "focus slice failed"), vim.log.levels.ERROR)
+        vim.notify(
+          "lineage.nvim: " .. (req_err.message or "focus slice failed"),
+          vim.log.levels.ERROR
+        )
         return
       end
       local card = res and res.projections and res.projections.hover_card
@@ -285,6 +297,11 @@ function M.focus(opts)
   if not uri then
     vim.notify("lineage.nvim: buffer has no file URI", vim.log.levels.WARN)
     return
+  end
+
+  if state.bufnr and state.bufnr ~= bufnr and vim.api.nvim_buf_is_valid(state.bufnr) then
+    vim.api.nvim_buf_clear_namespace(state.bufnr, ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(state.bufnr, indicator_ns, 0, -1)
   end
 
   state.active = true

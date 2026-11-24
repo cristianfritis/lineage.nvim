@@ -49,7 +49,8 @@ pub fn parse_rust_skeleton(uri: &str, source: &str) -> FileSkeleton {
                             imported_name: name.to_string(),
                             module_specifier: format!("mod:{name}"),
                             is_type_only: false,
-                            range: mapper.byte_range_to_canonical(child.start_byte(), child.end_byte()),
+                            range: mapper
+                                .byte_range_to_canonical(child.start_byte(), child.end_byte()),
                         });
                     }
                 }
@@ -133,45 +134,74 @@ fn extract_use_decl(
 ) {
     let range = mapper.byte_range_to_canonical(node.start_byte(), node.end_byte());
     let text = node.utf8_text(src).unwrap_or("");
-    let cleaned = text
-        .trim_start_matches("pub ")
-        .trim_start_matches("use ")
-        .trim_end_matches(';')
-        .trim();
+    let mut cleaned = text.trim();
+    if let Some(idx) = cleaned.find("use ") {
+        cleaned = &cleaned[idx + 4..];
+    }
+    cleaned = cleaned.trim_end_matches(';').trim();
     if cleaned.is_empty() {
         return;
     }
-    // Handle `use crate::auth::{verify, Token}` and `use crate::auth::verify`
-    if let Some((prefix, brace_part)) = cleaned.split_once('{') {
-        let base = prefix.trim_end_matches("::");
-        let inner = brace_part.trim_end_matches('}');
-        for item in inner.split(',') {
-            let sym = item.trim();
-            if !sym.is_empty() {
-                let (orig, local) = sym
-                    .split_once(" as ")
-                    .map(|(a, b)| (a.trim(), b.trim()))
-                    .unwrap_or((sym, sym));
-                out.push(ImportSpec {
-                    local_name: local.to_string(),
-                    imported_name: orig.to_string(),
-                    module_specifier: format!("{base}::{orig}"),
-                    is_type_only: false,
-                    range,
-                });
+    parse_use_tree("", cleaned, range, out);
+}
+
+fn parse_use_tree(prefix: &str, tree: &str, range: CanonicalRange, out: &mut Vec<ImportSpec>) {
+    let trimmed = tree.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some((head, rest)) = trimmed.split_once('{') {
+        let inner = rest.strip_suffix('}').unwrap_or(rest);
+        let head_clean = head.trim().trim_end_matches("::");
+        let new_prefix = if prefix.is_empty() {
+            head_clean.to_string()
+        } else if head_clean.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix}::{head_clean}")
+        };
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (idx, ch) in inner.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    parse_use_tree(&new_prefix, &inner[start..idx], range, out);
+                    start = idx + 1;
+                }
+                _ => {}
             }
         }
+        parse_use_tree(&new_prefix, &inner[start..], range, out);
     } else {
-        let (path_part, alias) = cleaned
+        let (path_part, alias) = trimmed
             .split_once(" as ")
             .map(|(a, b)| (a.trim(), Some(b.trim())))
-            .unwrap_or((cleaned, None));
-        let orig = path_part.rsplit("::").next().unwrap_or(path_part);
-        let local = alias.unwrap_or(orig);
+            .unwrap_or((trimmed, None));
+        let full_path = if prefix.is_empty() {
+            path_part.to_string()
+        } else if path_part == "self" {
+            prefix.to_string()
+        } else {
+            format!("{prefix}::{path_part}")
+        };
+        let orig = if path_part == "*" {
+            "*"
+        } else if path_part == "self" {
+            prefix.rsplit("::").next().unwrap_or(prefix)
+        } else {
+            path_part.rsplit("::").next().unwrap_or(path_part)
+        };
+        let local = if orig == "*" {
+            "*"
+        } else {
+            alias.unwrap_or(orig)
+        };
         out.push(ImportSpec {
             local_name: local.to_string(),
             imported_name: orig.to_string(),
-            module_specifier: path_part.to_string(),
+            module_specifier: full_path,
             is_type_only: false,
             range,
         });
@@ -323,7 +353,11 @@ struct RustLowerer<'a> {
 }
 
 impl<'a> RustLowerer<'a> {
-    fn new(src: &'a [u8], mapper: &'a PositionMapper, imports: HashMap<String, ImportSpec>) -> Self {
+    fn new(
+        src: &'a [u8],
+        mapper: &'a PositionMapper,
+        imports: HashMap<String, ImportSpec>,
+    ) -> Self {
         let entry = BasicBlock {
             id: BlockId(0),
             preds: Vec::new(),
@@ -377,10 +411,15 @@ impl<'a> RustLowerer<'a> {
         let range = self
             .mapper
             .byte_range_to_canonical(node.start_byte(), node.end_byte());
-        let snippet = node
-            .utf8_text(self.src)
-            .ok()
-            .map(|s| s.lines().next().unwrap_or("").trim().chars().take(80).collect());
+        let snippet = node.utf8_text(self.src).ok().map(|s| {
+            s.lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(80)
+                .collect()
+        });
         self.insts.push(SsiInst {
             id,
             block: self.cur_block,
@@ -1193,7 +1232,10 @@ impl<'a> RustLowerer<'a> {
             .to_string();
 
         // Check `Some(x)` / `Ok(x)` / `Err(e)` constructors
-        if fn_text == "Some" || fn_text == "Option::Some" || fn_text == "Ok" || fn_text == "Result::Ok"
+        if fn_text == "Some"
+            || fn_text == "Option::Some"
+            || fn_text == "Ok"
+            || fn_text == "Result::Ok"
         {
             return self.emit(
                 Some(fn_text.clone()),
@@ -1291,26 +1333,29 @@ impl<'a> RustLowerer<'a> {
 
         let tail = fn_text.rsplit("::").next().unwrap_or(&fn_text);
         let method = tail.rsplit('.').next().unwrap_or(tail);
-        let target = if lookup_rust_stdlib(&fn_text).is_some()
-            || lookup_rust_stdlib(method).is_some()
-        {
-            CallTarget::Stdlib(fn_text.clone())
-        } else if let Some(imp) = self.imports.get(&fn_text).cloned() {
-            CallTarget::Imported {
-                module_specifier: imp.module_specifier,
-                symbol: imp.imported_name,
-            }
-        } else if fn_text.contains("::") && (fn_text.starts_with("crate::") || fn_text.starts_with("super::") || fn_text.starts_with("self::")) {
-            let sym = fn_text.rsplit("::").next().unwrap_or(&fn_text).to_string();
-            CallTarget::Imported {
-                module_specifier: fn_text.clone(),
-                symbol: sym,
-            }
-        } else if fn_node.map(|f| f.kind() == "identifier").unwrap_or(false) {
-            CallTarget::Local(fn_text.clone())
-        } else {
-            CallTarget::Dynamic(fn_text.clone())
-        };
+        let target =
+            if lookup_rust_stdlib(&fn_text).is_some() || lookup_rust_stdlib(method).is_some() {
+                CallTarget::Stdlib(fn_text.clone())
+            } else if let Some(imp) = self.imports.get(&fn_text).cloned() {
+                CallTarget::Imported {
+                    module_specifier: imp.module_specifier,
+                    symbol: imp.imported_name,
+                }
+            } else if fn_text.contains("::")
+                && (fn_text.starts_with("crate::")
+                    || fn_text.starts_with("super::")
+                    || fn_text.starts_with("self::"))
+            {
+                let sym = fn_text.rsplit("::").next().unwrap_or(&fn_text).to_string();
+                CallTarget::Imported {
+                    module_specifier: fn_text.clone(),
+                    symbol: sym,
+                }
+            } else if fn_node.map(|f| f.kind() == "identifier").unwrap_or(false) {
+                CallTarget::Local(fn_text.clone())
+            } else {
+                CallTarget::Dynamic(fn_text.clone())
+            };
         self.symbolic_callees.push(target.clone());
 
         self.emit(
@@ -1361,6 +1406,8 @@ impl<'a> RustLowerer<'a> {
 
     fn finish(mut self, skeleton: &FunctionSkeleton) -> FunctionIr {
         self.span_index.sort_by_key(|(r, _)| (r.start, r.end));
+        let param_flow_to_return =
+            crate::ir::compute_param_flow_to_return(&self.insts, &self.returns);
         FunctionIr {
             symbol_id: skeleton.symbol_id.clone(),
             name: skeleton.name.clone(),
@@ -1372,12 +1419,8 @@ impl<'a> RustLowerer<'a> {
             danger_sinks: self.danger_sinks,
             span_index: self.span_index,
             local_summary: FnSummary {
-                return_absence: if self.return_absence == AbsenceValue::bottom() {
-                    AbsenceValue::present()
-                } else {
-                    self.return_absence
-                },
-                param_flow_to_return: Vec::new(),
+                return_absence: self.return_absence,
+                param_flow_to_return,
                 symbolic_callees: self.symbolic_callees,
             },
         }
@@ -1432,4 +1475,36 @@ fn is_mutating_method_heuristic(method: &str) -> bool {
         "reset" | "clear" | "push" | "pop" | "insert" | "remove" | "set" | "update" | "drain"
     ) || method.starts_with("set_")
         || method.ends_with("_mut")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_nested_braced_and_glob_rust_use_declarations() {
+        let src = r#"
+use std::{collections::{HashMap, HashSet}, io};
+use crate::helpers::*;
+use crate::auth::{self, Token as AuthToken};
+"#;
+        let skel = parse_rust_skeleton("file:///lib.rs", src);
+        let names: Vec<(&str, &str, &str)> = skel
+            .imports
+            .iter()
+            .map(|i| {
+                (
+                    i.local_name.as_str(),
+                    i.imported_name.as_str(),
+                    i.module_specifier.as_str(),
+                )
+            })
+            .collect();
+        assert!(names.contains(&("HashMap", "HashMap", "std::collections::HashMap")));
+        assert!(names.contains(&("HashSet", "HashSet", "std::collections::HashSet")));
+        assert!(names.contains(&("io", "io", "std::io")));
+        assert!(names.contains(&("*", "*", "crate::helpers::*")));
+        assert!(names.contains(&("auth", "auth", "crate::auth")));
+        assert!(names.contains(&("AuthToken", "Token", "crate::auth::Token")));
+    }
 }
