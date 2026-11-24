@@ -61,14 +61,14 @@ jobs:
             native_smoke: true
             darwin: false
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             features: ""
             musl: false
             cc: ""
             native_smoke: true
             darwin: true
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
             features: ""
             musl: false
             cc: ""
