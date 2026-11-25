@@ -80,7 +80,7 @@ function M.find_binary(opts)
     return pinned.path, label
   end
 
-  local ver = opts.version or (pinned and pinned.version) or "0.1.0"
+  local ver = opts.version or (pinned and pinned.version) or "0.2.0"
   local ext = (uv.os_uname().sysname == "Windows_NT") and ".exe" or ""
   local data_bin = vim.fn.stdpath("data") .. "/lineage/bin/lineage-engine-v" .. ver .. ext
   if vim.fn.executable(data_bin) == 1 then

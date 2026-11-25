@@ -327,7 +327,7 @@ function M.resolve_pinned_binary(opts)
   if not checksums then
     return nil, cs_err
   end
-  local version = checksums.version or config.get().version or "0.1.0"
+  local version = checksums.version or config.get().version or "0.2.0"
   local engine_tag = checksums.engine_tag or ("v" .. tostring(version))
   local dest = M.dest_path(engine_tag, opts)
   local target, target_err = M.detect_target(opts.sysname, opts.machine)

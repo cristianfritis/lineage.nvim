@@ -47,7 +47,11 @@ assert(
 -- 3. Repo checksums.json structure
 local cs, cs_err = install.read_checksums()
 assert(cs ~= nil, "Failed to read repo checksums.json: " .. tostring(cs_err))
-assert(cs.version == "0.1.0", "Expected version 0.1.0")
+assert(type(cs.version) == "string" and cs.version ~= "", "Expected version in checksums.json")
+assert(
+  cs.engine_tag == ("engine-v" .. cs.version),
+  "Expected engine_tag to match version, got " .. tostring(cs.engine_tag)
+)
 assert(
   cs.repo == "cristianfritis/lineage.nvim",
   "Expected repo cristianfritis/lineage.nvim, got " .. tostring(cs.repo)

@@ -1,23 +1,23 @@
 {
-  "version": "0.1.0",
-  "engine_tag": "engine-v0.1.0",
+  "version": "0.2.0",
+  "engine_tag": "engine-v0.2.0",
   "repo": "cristianfritis/lineage.nvim",
   "targets": {
     "x86_64-unknown-linux-musl": {
       "asset": "lineage-engine-x86_64-unknown-linux-musl",
-      "sha256": "b4f588c1230389a5b4f88b9c7a22e3cbcfb08c79615c177a8ae316179dfcd015"
+      "sha256": "TBD"
     },
     "aarch64-unknown-linux-musl": {
       "asset": "lineage-engine-aarch64-unknown-linux-musl",
-      "sha256": "d51139999e1a714d999cb63e51d6990464860bf24654772d1b29d7f632b858d4"
+      "sha256": "TBD"
     },
     "aarch64-apple-darwin": {
       "asset": "lineage-engine-aarch64-apple-darwin",
-      "sha256": "fac6ad636dace4a485dadc547406123c88a0f724de0dbc20abf2b89bb3b32823"
+      "sha256": "TBD"
     },
     "x86_64-apple-darwin": {
       "asset": "lineage-engine-x86_64-apple-darwin",
-      "sha256": "ed179e4c639884eb9ab61f7e4c218bfbeed91945faafddc88e9a35557917f434"
+      "sha256": "TBD"
     }
   }
 }
