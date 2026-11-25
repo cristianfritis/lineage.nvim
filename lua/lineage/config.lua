@@ -16,6 +16,7 @@ M.defaults = {
       jump_cursor = "<CR>",
       jump_prefix = "g",
       toggle_unverified = "gu",
+      export = "ge",
       close = { "q", "<Esc>" },
     },
   },
@@ -24,6 +25,18 @@ M.defaults = {
   },
   tree = {
     height = 14,
+    keymaps = {
+      export = "e",
+    },
+  },
+  export = {
+    default_format = "mermaid",
+    lsp_timeout_ms = 500,
+    picker = true,
+    html = {
+      open = true,
+      cache_max_files = 20,
+    },
   },
   exclude_tests = false,
 }

@@ -1,0 +1,35 @@
+## Why
+
+`lineage.nvim`'s Hover, Inline Focus Mode, and Interactive Tree Panel are ephemeral, confined to Neovim, and duplicate shared subtrees whenever converging nullability paths merge—while the existing `lineage-engine slice --format dot` stub omits Phase 2 LSP resolution, mishandles escaping, and uses `file.parent()` instead of the workspace root. Stage C.1 ([docs/designs/lineage-stage-c1-graph-exporters.md](../../../docs/designs/lineage-stage-c1-graph-exporters.md), including pre-freeze folds `C1-1`–`C1-6`) closes six concrete `SliceGraph` producer defects (Block 0) and establishes a deterministic, 100% offline shared Export IR (`engine/src/export/`) delivering **Mermaid** and **Graphviz DOT** diagrams from both Neovim and the standalone CLI with byte-identical output, strict path privacy, and clean extension seams for Stage C.2's Offline Interactive HTML+SVG Viewer.
+
+## What Changes
+
+- **Block 0 — `SliceGraph` Producer Hardening (`SCHEMA_VERSION = 1` Additive):**
+  - Extend `FlowNode` (`is_guard`, `guard_text`, `is_danger_sink`, `danger_kind`), `FlowEdge` (`edge_side: Option<EdgeSide>` for `Both` slices), `HoverRisk` (`node_id`), `ExpandParams` (`parent_query_id`, `parent_node_id`), and `EngineCapabilities` (`export_formats`) with backward-compatible `#[serde(default)]` fields.
+  - Emit `ProjectField`/`ProjectIndex`/`UnwrapVariant` edges, cross-file `To` callee nodes with real `file_id`, separated `cycle_group_id` (from `scc::tarjan_scc`) vs. deterministic 3-color DFS feedback `is_back_edge` (keeping forward cycle edges top-to-bottom), merge Phase 2 LSP results directly into `SliceGraph` (propagating `lsp_timeout_ms` to both `phase2_ceiling_ms` and per-call LSP timeout), upgrade `uri_to_path` for `%20` percent-decoding and Windows `file:///C:/...` drive normalization, and fix `project_tree_rows` DFS cycle tracking to use the active recursion stack.
+- **Engine Snapshot LRU & Additive `lineage/export` RPC (`PROTOCOL_VERSION = 1`):**
+  - Add a bounded 4-slot `QuerySnapshotCache` LRU in `TransportState` keeping `include_graph = false` on Hover/Tree wire hot paths while updating snapshots in-place from `execute_phase2` and `expand_node` (collision-free `exp{k}_` node IDs and remapped `file_id`s).
+  - Add `"lineage/export"` with tri-state `include_snippets: Option<bool>` (`None => false` uniformly across formats), Phase 2 worker-pool dispatch for fresh slices (`lsp_timeout_ms = 500`, zero Phase 1 blocking, explicit handling for in-flight LRU hits and full queues), and explicit completeness badges (`Budget-capped (partial)` vs. `Static only (...)`).
+- **Shared Pure-Rust Export IR & Mermaid/DOT Serializers (`engine/src/export/`):**
+  - Build canonical `ExportGraph` (`ir.rs`) stripping volatile metadata (`query_id`, `trace_id`, timings), normalizing causal orientation (`origin -> consumer`) with `Both` `edge_side` partitioning, separating SCC `cycle_group_id` from deterministic 3-color DFS `is_back_edge`, centralizing UTF-8 char-safe `<= 120`-char snippet trimming and scrubbing, retaining full inspector metadata for Stage C.2, enforcing `max_nodes = 200`, `max_edges = 800`, and `max_label_chars = 256` via deterministic BFS pruning, and applying 2-tier path sanitization (`<workspace-rel>` POSIX vs. `<external>/<sanitized-tail>` in `sanitize.rs`).
+  - Implement flat file-pill GitHub-flavored Mermaid (`mermaid.rs`, 45 KB guard) and Graphviz DOT (`dot.rs`, unified with `slice --format dot`) with zero new Cargo crates and `< 200 KB` binary delta.
+- **Unified CLI, Multi-Arg Neovim Commands, Transport Hardening & Observability:**
+  - Split `CliFormat` into `SliceCliFormat { Json, Text, Dot }` and `ExportCliFormat { Mermaid, Dot }`; add `Commands::Export`, `CliDirection::Both`, nearest-`.git`/cwd `--workspace-root`, `--from-envelope`, tri-state `--snippets`/`--no-snippets`, and Phase 2 `--lsp-fixture` on `Commands::Slice`.
+  - Extract `lua/lineage/commands.lua` (`nargs = "*"`) and `lua/lineage/export.lua`; add Tree `e` / Hover `ge` triggers (intersecting `capabilities.export_formats` with Lua-supported formats), `<Plug>(LineageExport{,Mermaid,Dot})`, clipboard `+` -> `"` `WARN` fallback, overwrite protection (`:Lineage export!`), capability check fail-fast (`:Lineage install!`), chunk-array NDJSON buffering + decode-error callback rejection + capability reset in `lua/lineage/client.lua`, and `lineage/export` formatting in `:Lineage status` (`lua/lineage/debug.lua`).
+
+## Capabilities
+
+### New Capabilities
+- `graph-export`: Shared pure-Rust `ExportGraph` IR (`ir.rs`), 2-tier path sanitization (`sanitize.rs`), deterministic Mermaid (`mermaid.rs`) and Graphviz DOT (`dot.rs`) serializers, 4-slot `QuerySnapshotCache` LRU with collision-free `expand_node` merge, and the additive `lineage/export` NDJSON RPC with Phase 2 worker-pool settle.
+
+### Modified Capabilities
+- `core-ir-and-slicer`: Block 0 `SliceGraph` producer hardening—Phase 2 LSP graph merging, cross-file `To` callee nodes, `ProjectField`/`ProjectIndex`/`UnwrapVariant` edges, separated SCC `cycle_group_id` vs. deterministic 3-color DFS `is_back_edge`, additive typed `FlowNode`/`FlowEdge`/`HoverRisk`/`ExpandParams` metadata, percent-decoded/Windows `uri_to_path`, and recursion-stack cycle detection in `project_tree_rows`.
+- `observability-and-cli`: Split `SliceCliFormat` and `ExportCliFormat`, add `lineage-engine export` (`Both`, `--workspace-root`, `--from-envelope`, tri-state `--snippets`/`--no-snippets`, unified `slice --format dot` + `--lsp-fixture` Phase 2), emit source-free export `tracing::info!` spans, harden `lua/lineage/client.lua` NDJSON chunk buffering/decode rejection/capability lifecycle, and format `lineage/export` telemetry in `:Lineage status`.
+- `neovim-ui`: Upgrade `:Lineage` to `nargs = "*"` via `lua/lineage/commands.lua`, add `:Lineage export <format> [path] [flags]`, `<Plug>(LineageExport{,Mermaid,Dot})`, Tree `e` / Hover `ge` triggers with capability-intersected format picker, strict context precedence (`Tree > Hover > Cursor`), clipboard `+` -> `"` `WARN` fallback, `:Lineage export!` overwrite guard, and pre-Stage-C capability mismatch fail-fast.
+
+## Impact
+
+- **Rust Engine (`engine/`):** `src/lib.rs`, `src/protocol/{schema.rs, transport.rs}`, `src/cache/memory.rs`, `src/slicer/{mod.rs, pipeline.rs, projectors.rs}`, `src/export/{mod.rs, ir.rs, sanitize.rs, mermaid.rs, dot.rs}`, `src/{cli.rs, main.rs}`, `tests/export_golden.rs`. Zero new Cargo crates; `< 200 KB` release binary delta.
+- **Neovim Plugin (`lua/`, `plugin/`, `tests/`):** `plugin/lineage.lua`, `lua/lineage/{init.lua, config.lua, client.lua, debug.lua, commands.lua, export.lua}`, `lua/lineage/ui/{tree.lua, hover.lua}`, `tests/test_export.lua`.
+- **Docs & Specs:** `README.md` (including fixing the stale Go adapter note at line 154), `doc/lineage.txt`, and OpenSpec capabilities (`graph-export`, `core-ir-and-slicer`, `observability-and-cli`, `neovim-ui`).
+- **Backward Compatibility:** `PROTOCOL_VERSION = 1` and `SCHEMA_VERSION = 1` remain backward-compatible via additive `#[serde(default)]` fields and `EngineCapabilities.export_formats`.

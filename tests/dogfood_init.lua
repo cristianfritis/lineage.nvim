@@ -61,3 +61,6 @@ end
 
 -- Rust: rust-analyzer
 start_lsp_if_available("rust_analyzer", { "rust-analyzer" }, { "rust" }, { "Cargo.toml", ".git" })
+
+-- Go: gopls
+start_lsp_if_available("gopls", { "gopls" }, { "go" }, { "go.work", "go.mod", ".git" })

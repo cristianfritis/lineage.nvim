@@ -138,8 +138,10 @@ pub fn project_focus_spans(graph: &SliceGraph, files: &[FileEntry]) -> Vec<Focus
             (0u8, "[OK]".to_string(), "LineageStatePresent".to_string())
         };
 
-        let role = if node.label.starts_with("narrow ") {
+        let role = if node.is_guard || node.label.starts_with("narrow ") {
             "narrow".to_string()
+        } else if node.is_danger_sink {
+            "danger".to_string()
         } else if is_unknown {
             "unknown".to_string()
         } else {
@@ -188,7 +190,7 @@ pub fn project_tree_rows(
     }
 
     let mut rows = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
+    let mut in_stack: HashSet<String> = HashSet::new();
 
     #[allow(clippy::too_many_arguments)]
     fn dfs<'a>(
@@ -199,7 +201,7 @@ pub fn project_tree_rows(
         file_map: &HashMap<u32, &str>,
         node_map: &HashMap<&str, &'a crate::protocol::schema::FlowNode>,
         adj: &HashMap<&str, Vec<&'a crate::protocol::schema::FlowEdge>>,
-        visited: &mut HashSet<String>,
+        in_stack: &mut HashSet<String>,
         rows: &mut Vec<TreeRow>,
     ) {
         let Some(node) = node_map.get(node_id).copied() else {
@@ -266,7 +268,10 @@ pub fn project_tree_rows(
         }
 
         for edge in outgoing {
-            let cycle_hit = edge.is_back_edge || !visited.insert(edge.to.clone());
+            let cycle_hit = edge.is_back_edge || in_stack.contains(edge.to.as_str());
+            if !cycle_hit {
+                in_stack.insert(edge.to.clone());
+            }
             dfs(
                 edge.to.as_str(),
                 depth + 1,
@@ -275,16 +280,19 @@ pub fn project_tree_rows(
                 file_map,
                 node_map,
                 adj,
-                visited,
+                in_stack,
                 rows,
             );
+            if !cycle_hit {
+                in_stack.remove(edge.to.as_str());
+            }
         }
     }
 
     for root in root_ids {
         if let Some(root_node) = node_map.get(root.as_str()) {
             let origin = root_node.label.clone();
-            if visited.insert(root.clone()) {
+            if in_stack.insert(root.clone()) {
                 dfs(
                     root.as_str(),
                     0,
@@ -293,9 +301,10 @@ pub fn project_tree_rows(
                     &file_map,
                     &node_map,
                     &adj,
-                    &mut visited,
+                    &mut in_stack,
                     &mut rows,
                 );
+                in_stack.remove(root.as_str());
             }
         }
     }
@@ -349,6 +358,10 @@ mod tests {
                         unknown_reasons: vec![UnknownReason::ExternalUntyped],
                     },
                     provenance: "local_ssi".to_string(),
+                    is_guard: false,
+                    guard_text: None,
+                    is_danger_sink: false,
+                    danger_kind: None,
                 },
                 FlowNode {
                     id: "n1".to_string(),
@@ -367,6 +380,10 @@ mod tests {
                         unknown_reasons: vec![],
                     },
                     provenance: "local_ssi".to_string(),
+                    is_guard: false,
+                    guard_text: None,
+                    is_danger_sink: false,
+                    danger_kind: None,
                 },
             ],
             edges: vec![],

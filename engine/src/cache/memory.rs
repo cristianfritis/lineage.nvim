@@ -68,16 +68,65 @@ impl GuardError {
     }
 }
 
+fn percent_decode_utf8(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub fn uri_to_path(uri: &str) -> PathBuf {
     if let Some(stripped) = uri.strip_prefix("file://") {
-        PathBuf::from(stripped)
+        let stripped = stripped
+            .strip_prefix("localhost/")
+            .map_or(stripped, |_rest| {
+                // Keep leading slash for POSIX paths (file://localhost/home/...)
+                &stripped["localhost".len()..]
+            });
+        let decoded = percent_decode_utf8(stripped);
+        let b = decoded.as_bytes();
+        // Normalize Windows drive URI `/C:/...` -> `C:/...`
+        let normalized =
+            if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+                &decoded[1..]
+            } else {
+                decoded.as_str()
+            };
+        PathBuf::from(normalized)
     } else {
         PathBuf::from(uri)
     }
 }
 
 pub fn path_to_uri(path: &Path) -> String {
-    format!("file://{}", path.to_string_lossy())
+    let raw = path.to_string_lossy();
+    let norm = raw.replace('\\', "/");
+    let b = norm.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        format!("file:///{norm}")
+    } else {
+        format!("file://{norm}")
+    }
 }
 
 pub fn check_text_guards(text: &str) -> Result<(), GuardError> {

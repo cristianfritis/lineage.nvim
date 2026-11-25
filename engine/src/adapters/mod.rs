@@ -7,6 +7,7 @@ use crate::ir::{
 };
 use crate::protocol::schema::{CanonicalPos, CanonicalRange, UnknownReason};
 
+pub mod go;
 pub mod python;
 pub mod rust;
 pub mod typescript;
@@ -42,6 +43,15 @@ pub trait LanguageAdapter: Send + Sync {
         workspace_root: Option<&Path>,
         budget_start: Instant,
     ) -> ImportResolution;
+
+    fn resolve_same_package_siblings(
+        &self,
+        _from_file: &Path,
+        _exclude_tests: bool,
+        _budget_start: Instant,
+    ) -> Vec<PathBuf> {
+        Vec::new()
+    }
 
     fn stdlib_summary(&self, symbol: &str) -> Option<AbsenceValue>;
 

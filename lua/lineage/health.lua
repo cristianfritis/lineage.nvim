@@ -107,6 +107,17 @@ function M.check()
       if status_res.log_path then
         vim.health.info("Rotating log path: " .. status_res.log_path)
       end
+      local caps = client.capabilities()
+      if caps and type(caps.export_formats) == "table" then
+        local fmts = table.concat(caps.export_formats, ", ")
+        if vim.tbl_contains(caps.export_formats, "html") then
+          vim.health.ok("Export formats: " .. fmts)
+        else
+          vim.health.warn(
+            "Export formats: " .. fmts .. " (missing 'html'; run :Lineage install! to update)"
+          )
+        end
+      end
       for _, ewma in ipairs(status_res.ewma_clients or {}) do
         vim.health.info(
           string.format(
@@ -124,6 +135,44 @@ function M.check()
     else
       vim.health.warn("Sidecar status timed out")
     end
+  end
+
+  -- 5. Export cache & browser open readiness
+  local export_cache = require("lineage.export_cache")
+  local stats = export_cache.stats()
+  if stats.is_symlink then
+    vim.health.error("Export cache directory is a symlink (refused): " .. stats.dir)
+  elseif stats.exists and stats.is_dir then
+    if not export_cache.is_windows() and not stats.mode_ok then
+      vim.health.warn(
+        string.format(
+          "Export cache permissions %s (expected 0700): %s",
+          tostring(stats.mode_octal),
+          stats.dir
+        )
+      )
+    else
+      vim.health.ok(
+        string.format(
+          "Export cache: %s (%s%d file(s), %d bytes)",
+          stats.dir,
+          stats.mode_octal and ("mode " .. stats.mode_octal .. ", ") or "",
+          stats.file_count,
+          stats.total_bytes
+        )
+      )
+    end
+  else
+    vim.health.info("Export cache: " .. stats.dir .. " (not yet created)")
+  end
+  if stats.can_open then
+    vim.health.ok("Browser open: ready (vim.ui.open)")
+  else
+    vim.health.info(
+      "Browser open: skipped ("
+        .. tostring(stats.open_reason)
+        .. "; HTML exports will save to file and notify path)"
+    )
   end
 end
 

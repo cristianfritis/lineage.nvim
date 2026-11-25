@@ -154,6 +154,8 @@ pub struct EngineCapabilities {
     pub languages: Vec<String>,
     pub reverse_rpc: bool,
     pub delta_notifications: bool,
+    #[serde(default)]
+    pub export_formats: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +276,13 @@ pub struct AbsenceSummary {
     pub unknown_reasons: Vec<UnknownReason>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeSide {
+    Upstream,
+    Downstream,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowNode {
     pub id: String,
@@ -285,6 +294,14 @@ pub struct FlowNode {
     pub snippet: Option<String>,
     pub absence: AbsenceSummary,
     pub provenance: String,
+    #[serde(default)]
+    pub is_guard: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_text: Option<String>,
+    #[serde(default)]
+    pub is_danger_sink: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub danger_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +314,8 @@ pub struct FlowEdge {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cycle_group_id: Option<u32>,
     pub provenance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_side: Option<EdgeSide>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +350,8 @@ pub struct HoverRisk {
     pub range: CanonicalRange,
     pub kind: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +426,10 @@ pub struct ExpandParams {
     pub lsp_attached: bool,
     #[serde(default)]
     pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub parent_query_id: Option<u64>,
+    #[serde(default)]
+    pub parent_node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,4 +572,77 @@ pub struct StatusResult {
     pub log_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rss_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    Mermaid,
+    Dot,
+    Html,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportSourceMode {
+    LiveSnapshot,
+    FreshSlice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase2Status {
+    Complete,
+    NotNeeded,
+    Skipped,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportParams {
+    pub format: ExportFormat,
+    #[serde(default)]
+    pub query_id: Option<u64>,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub position: Option<LspPosition>,
+    #[serde(default)]
+    pub offset_encoding: OffsetEncoding,
+    #[serde(default)]
+    pub direction: SliceDirection,
+    #[serde(default)]
+    pub exclude_tests: bool,
+    #[serde(default)]
+    pub lsp_attached: bool,
+    #[serde(default)]
+    pub lsp_client_name: Option<String>,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub null_only: bool,
+    #[serde(default)]
+    pub include_snippets: Option<bool>,
+    #[serde(default)]
+    pub no_lsp: bool,
+    #[serde(default)]
+    pub lsp_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub absolute_paths: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportResult {
+    pub schema_version: u32,
+    pub format: ExportFormat,
+    pub content: String,
+    pub source_mode: ExportSourceMode,
+    pub phase2_status: Phase2Status,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub truncated_nodes: usize,
+    pub truncated_edges: usize,
+    pub truncation: Vec<TruncationReason>,
+    pub completeness_badges: Vec<String>,
+    pub warnings: Vec<String>,
 }

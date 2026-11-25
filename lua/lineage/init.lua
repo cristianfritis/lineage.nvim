@@ -97,4 +97,18 @@ function M.install(opts)
   return require("lineage.install").install(opts)
 end
 
+function M.export(opts)
+  if not initialized then
+    M.setup()
+  end
+  return require("lineage.export").export(opts)
+end
+
+function M.export_clean(opts)
+  if not initialized then
+    M.setup()
+  end
+  return require("lineage.export").clean(opts)
+end
+
 return M

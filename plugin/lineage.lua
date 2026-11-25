@@ -4,58 +4,12 @@ end
 vim.g.loaded_lineage = 1
 
 vim.api.nvim_create_user_command("Lineage", function(opts)
-  local sub = opts.fargs[1] or "hover"
-  local lineage = require("lineage")
-  if sub == "hover" then
-    lineage.hover()
-  elseif sub == "focus" then
-    lineage.focus()
-  elseif sub == "pin" then
-    lineage.pin()
-  elseif sub == "clear" then
-    lineage.clear()
-  elseif sub == "to" then
-    lineage.to()
-  elseif sub == "from" then
-    lineage.from()
-  elseif sub == "both" then
-    lineage.both()
-  elseif sub == "back" then
-    lineage.back()
-  elseif sub == "install!" or (sub == "install" and opts.bang) then
-    lineage.install({ force = true })
-  elseif sub == "install" then
-    lineage.install()
-  elseif sub == "status" then
-    lineage.status()
-  elseif sub == "log" then
-    lineage.log()
-  elseif sub == "debug-dump" then
-    lineage.debug_dump()
-  else
-    vim.notify("lineage.nvim: unknown subcommand '" .. sub .. "'", vim.log.levels.WARN)
-  end
+  require("lineage.commands").dispatch(opts)
 end, {
-  nargs = "?",
+  nargs = "*",
   bang = true,
-  complete = function(arg_lead)
-    local cmds = {
-      "hover",
-      "focus",
-      "pin",
-      "clear",
-      "to",
-      "from",
-      "both",
-      "back",
-      "install",
-      "status",
-      "log",
-      "debug-dump",
-    }
-    return vim.tbl_filter(function(c)
-      return vim.startswith(c, arg_lead)
-    end, cmds)
+  complete = function(arg_lead, cmd_line, cursor_pos)
+    return require("lineage.commands").complete(arg_lead, cmd_line, cursor_pos)
   end,
   desc = "lineage.nvim commands",
 })
@@ -83,3 +37,19 @@ end, { silent = true, desc = "Lineage: Open Data Flow From Here tree" })
 vim.keymap.set("n", "<Plug>(LineageBack)", function()
   require("lineage").back()
 end, { silent = true, desc = "Lineage: Jump back in Lineage stack" })
+
+vim.keymap.set("n", "<Plug>(LineageExport)", function()
+  require("lineage.export").pick_and_export()
+end, { silent = true, desc = "Lineage: Export active slice graph" })
+
+vim.keymap.set("n", "<Plug>(LineageExportMermaid)", function()
+  require("lineage").export({ format = "mermaid" })
+end, { silent = true, desc = "Lineage: Export active slice graph as Mermaid" })
+
+vim.keymap.set("n", "<Plug>(LineageExportDot)", function()
+  require("lineage").export({ format = "dot" })
+end, { silent = true, desc = "Lineage: Export active slice graph as Graphviz DOT" })
+
+vim.keymap.set("n", "<Plug>(LineageExportHtml)", function()
+  require("lineage").export({ format = "html" })
+end, { silent = true, desc = "Lineage: Export active slice graph as offline HTML" })

@@ -15,7 +15,7 @@ local state = {
   stdin = nil,
   stdout = nil,
   stderr = nil,
-  buf = "",
+  chunks = {},
   next_id = 1,
   next_query_id = 0,
   pending = {},
@@ -27,9 +27,14 @@ local state = {
   restarts = 0,
   stderr_ring = {},
   initialized = false,
+  capabilities = nil,
   protocol_mismatch = false,
   binary_path = nil,
 }
+
+function M.capabilities()
+  return state.capabilities
+end
 
 local function push_telemetry(entry)
   table.insert(state.telemetry_ring, entry)
@@ -124,7 +129,9 @@ function M.stop()
   state.stdin = nil
   state.stdout = nil
   state.stderr = nil
+  state.chunks = {}
   state.initialized = false
+  state.capabilities = nil
   drain_init_waiters("lineage-engine stopped", nil)
 end
 
@@ -227,14 +234,19 @@ local function on_stdout_chunk(err, data)
   if err or not data then
     return
   end
-  state.buf = state.buf .. data
+  table.insert(state.chunks, data)
+  if not data:find("\n", 1, true) then
+    return
+  end
+  local combined = table.concat(state.chunks)
+  local pos = 1
   while true do
-    local nl = state.buf:find("\n", 1, true)
+    local nl = combined:find("\n", pos, true)
     if not nl then
       break
     end
-    local line = state.buf:sub(1, nl - 1)
-    state.buf = state.buf:sub(nl + 1)
+    local line = combined:sub(pos, nl - 1)
+    pos = nl + 1
     if line ~= "" then
       local ok, decoded = pcall(vim.json.decode, line)
       if ok and type(decoded) == "table" then
@@ -243,9 +255,33 @@ local function on_stdout_chunk(err, data)
         end)
       else
         state.parse_errors = state.parse_errors + 1
+        local failed_id = line:match('"id"%s*:%s*"([^"]+)"')
+          or tonumber(line:match('"id"%s*:%s*(%d+)'))
+        vim.schedule(function()
+          if failed_id and state.pending[failed_id] then
+            local cb = state.pending[failed_id]
+            state.pending[failed_id] = nil
+            pcall(cb, {
+              code = -32700,
+              message = "Failed to decode JSON response from lineage-engine",
+            }, nil)
+          else
+            reject_all_pending("Failed to decode JSON frame from lineage-engine")
+          end
+        end)
       end
     end
   end
+  local tail = combined:sub(pos)
+  state.chunks = (tail ~= "") and { tail } or {}
+end
+
+function M._feed_stdout_chunk(data)
+  on_stdout_chunk(nil, data)
+end
+
+function M._register_pending_for_test(id, cb)
+  state.pending[id] = cb
 end
 
 function M.ensure_started(cb)
@@ -286,6 +322,8 @@ function M.ensure_started(cb)
     vim.schedule(function()
       state.handle = nil
       state.initialized = false
+      state.capabilities = nil
+      state.chunks = {}
       state.restarts = state.restarts + 1
       sync.reset()
       local exit_msg = "lineage-engine exited (code="
@@ -307,7 +345,8 @@ function M.ensure_started(cb)
   state.stdin = stdin
   state.stdout = stdout
   state.stderr = stderr
-  state.buf = ""
+  state.chunks = {}
+  state.capabilities = nil
   table.insert(state.init_waiters, cb)
 
   stdout:read_start(on_stdout_chunk)
@@ -343,6 +382,7 @@ function M.ensure_started(cb)
       return
     end
     state.initialized = true
+    state.capabilities = res.capabilities
     state.restarts = 0
     drain_init_waiters(nil, true)
   end)
@@ -366,8 +406,8 @@ function M.request(method, params, cb)
   local qid = type(params) == "table" and params.query_id or nil
 
   state.pending[id] = function(err, result)
+    local rtt_ms = math.floor((uv.hrtime() - t0) / 1e6)
     if method == "lineage/slice" then
-      local rtt_ms = math.floor((uv.hrtime() - t0) / 1e6)
       local stats = (type(result) == "table" and result.stats) or {}
       push_telemetry({
         query_id = qid,
@@ -377,6 +417,20 @@ function M.request(method, params, cb)
         phase2_ms = stats.phase2_ms,
         rtt_ms = rtt_ms,
         delta_received = false,
+        parse_errors = state.parse_errors,
+        restarts = state.restarts,
+      })
+    elseif method == "lineage/export" then
+      local res_tbl = type(result) == "table" and result or {}
+      push_telemetry({
+        query_id = qid,
+        method = method,
+        format = res_tbl.format or (type(params) == "table" and params.format) or "unknown",
+        source_mode = res_tbl.source_mode,
+        phase2_status = res_tbl.phase2_status,
+        output_bytes = type(res_tbl.content) == "string" and #res_tbl.content or 0,
+        rtt_ms = rtt_ms,
+        error = err and (err.message or tostring(err)) or nil,
         parse_errors = state.parse_errors,
         restarts = state.restarts,
       })
@@ -399,6 +453,21 @@ end
 
 function M.get_binary_path()
   return state.binary_path or M.find_binary()
+end
+
+function M.annotate_last_export_telemetry(fields)
+  if type(fields) ~= "table" then
+    return
+  end
+  for i = #state.telemetry_ring, 1, -1 do
+    local entry = state.telemetry_ring[i]
+    if entry.method == "lineage/export" then
+      for k, v in pairs(fields) do
+        entry[k] = v
+      end
+      break
+    end
+  end
 end
 
 return M

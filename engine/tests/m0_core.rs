@@ -174,6 +174,10 @@ fn test_pipeline_determinism_contraction_and_test_filter() {
             snippet: None,
             absence: present.clone(),
             provenance: "local".to_string(),
+            is_guard: false,
+            guard_text: None,
+            is_danger_sink: false,
+            danger_kind: None,
         },
         RawSliceNode {
             id: "copy1".to_string(),
@@ -185,6 +189,10 @@ fn test_pipeline_determinism_contraction_and_test_filter() {
             snippet: None,
             absence: present.clone(),
             provenance: "local".to_string(),
+            is_guard: false,
+            guard_text: None,
+            is_danger_sink: false,
+            danger_kind: None,
         },
         RawSliceNode {
             id: "origin".to_string(),
@@ -196,6 +204,10 @@ fn test_pipeline_determinism_contraction_and_test_filter() {
             snippet: None,
             absence: present.clone(),
             provenance: "local".to_string(),
+            is_guard: false,
+            guard_text: None,
+            is_danger_sink: false,
+            danger_kind: None,
         },
         RawSliceNode {
             id: "test_node".to_string(),
@@ -207,6 +219,10 @@ fn test_pipeline_determinism_contraction_and_test_filter() {
             snippet: None,
             absence: present,
             provenance: "local".to_string(),
+            is_guard: false,
+            guard_text: None,
+            is_danger_sink: false,
+            danger_kind: None,
         },
     ];
     let raw_edges = vec![
@@ -217,6 +233,7 @@ fn test_pipeline_determinism_contraction_and_test_filter() {
             is_back_edge: false,
             cycle_group_id: None,
             provenance: "def_use".to_string(),
+            edge_side: None,
         },
         RawSliceEdge {
             from: "copy1".to_string(),
@@ -225,6 +242,7 @@ fn test_pipeline_determinism_contraction_and_test_filter() {
             is_back_edge: false,
             cycle_group_id: None,
             provenance: "def_use".to_string(),
+            edge_side: None,
         },
         RawSliceEdge {
             from: "root".to_string(),
@@ -233,6 +251,7 @@ fn test_pipeline_determinism_contraction_and_test_filter() {
             is_back_edge: false,
             cycle_group_id: None,
             provenance: "def_use".to_string(),
+            edge_side: None,
         },
     ];
 

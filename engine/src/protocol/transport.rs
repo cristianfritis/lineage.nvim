@@ -1,24 +1,31 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Sender};
 
 use crate::cache::{current_process_rss_bytes, parse_worker_cap};
+use crate::export::{render_export, ExportOptions};
 use crate::protocol::schema::{
-    CancelRequestParams, CloseBufferParams, DebugDumpParams, EngineCapabilities, ExpandParams,
-    InitializeParams, InitializeResult, LspResolveBatchParams, LspResolveBatchResult, RpcError,
-    RpcId, RpcNotification, RpcRequest, RpcResponse, SliceParams, StatusResult, SyncBufferParams,
-    PROTOCOL_VERSION, SCHEMA_VERSION,
+    CancelRequestParams, CloseBufferParams, DebugDumpParams, EdgeSide, EngineCapabilities,
+    ExpandParams, ExpandResult, ExportParams, ExportSourceMode, FileEntry, FlowEdge, FlowNode,
+    InitializeParams, InitializeResult, LspResolveBatchParams, LspResolveBatchResult, NodeKind,
+    Phase2Status, RpcError, RpcId, RpcNotification, RpcRequest, RpcResponse, SliceDirection,
+    SliceEnvelope, SliceGraph, SliceParams, StatusResult, SyncBufferParams, PROTOCOL_VERSION,
+    SCHEMA_VERSION,
 };
 use crate::resolver::ewma::EwmaTracker;
 use crate::resolver::lsp_provider::{
     NullLspProvider, ReverseRpcError, ReverseRpcSender, StdioLspProvider,
 };
 use crate::slicer::{Phase2Context, SlicerEngine};
+
+pub const SNAPSHOT_LRU_CAPACITY: usize = 4;
+pub const DEFAULT_EXPORT_LSP_TIMEOUT_MS: u64 = 500;
 
 pub struct QueryCancelGuard {
     pub query_id: u64,
@@ -31,7 +38,243 @@ impl Drop for QueryCancelGuard {
     }
 }
 
-pub struct Phase2Job {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPhase2State {
+    InFlight,
+    Settled(Phase2Status),
+}
+
+#[derive(Debug, Clone)]
+pub struct MaterializedSliceSnapshot {
+    pub envelope: SliceEnvelope,
+    pub workspace_root: Option<String>,
+    pub lsp_attached: bool,
+    pub phase2_state: SnapshotPhase2State,
+    pub expand_seq: u32,
+}
+
+#[derive(Default)]
+pub struct QuerySnapshotCache {
+    entries: HashMap<u64, MaterializedSliceSnapshot>,
+    lru_order: VecDeque<u64>,
+}
+
+impl QuerySnapshotCache {
+    pub fn insert(&mut self, query_id: u64, snapshot: MaterializedSliceSnapshot) {
+        if self.entries.contains_key(&query_id) {
+            self.lru_order.retain(|&id| id != query_id);
+        }
+        while self.entries.len() >= SNAPSHOT_LRU_CAPACITY {
+            if let Some(oldest) = self.lru_order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.entries.insert(query_id, snapshot);
+        self.lru_order.push_back(query_id);
+    }
+
+    pub fn get_cloned(&mut self, query_id: u64) -> Option<MaterializedSliceSnapshot> {
+        let snap = self.entries.get(&query_id)?.clone();
+        self.lru_order.retain(|&id| id != query_id);
+        self.lru_order.push_back(query_id);
+        Some(snap)
+    }
+
+    pub fn update_phase2(
+        &mut self,
+        query_id: u64,
+        delta_env: &SliceEnvelope,
+        full_graph: SliceGraph,
+        status: Phase2Status,
+    ) {
+        let Some(snap) = self.entries.get_mut(&query_id) else {
+            return;
+        };
+        if snap.expand_seq == 0 {
+            let mut updated = delta_env.clone();
+            updated.graph = Some(full_graph);
+            snap.envelope = updated;
+        } else {
+            // Preserve any lazily expanded exp{k}_ subtrees & files merged prior to Phase 2 finish.
+            let prev_graph = snap.envelope.graph.take().unwrap_or(SliceGraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            });
+            let mut merged_files = delta_env.files.clone();
+            let mut uri_to_fid: HashMap<String, u32> = merged_files
+                .iter()
+                .map(|f| (f.uri.clone(), f.file_id))
+                .collect();
+            let mut old_fid_to_new: HashMap<u32, u32> = HashMap::new();
+            for old_f in &snap.envelope.files {
+                if let Some(&fid) = uri_to_fid.get(&old_f.uri) {
+                    old_fid_to_new.insert(old_f.file_id, fid);
+                } else {
+                    let fid = merged_files.len() as u32;
+                    merged_files.push(FileEntry {
+                        file_id: fid,
+                        uri: old_f.uri.clone(),
+                    });
+                    uri_to_fid.insert(old_f.uri.clone(), fid);
+                    old_fid_to_new.insert(old_f.file_id, fid);
+                }
+            }
+            let mut merged_graph = full_graph;
+            for mut n in prev_graph.nodes {
+                if n.id.starts_with("exp") {
+                    if let Some(&nfid) = old_fid_to_new.get(&n.file_id) {
+                        n.file_id = nfid;
+                    }
+                    merged_graph.nodes.push(n);
+                }
+            }
+            for e in prev_graph.edges {
+                if e.from.starts_with("exp") || e.to.starts_with("exp") {
+                    merged_graph.edges.push(e);
+                }
+            }
+            let mut updated = delta_env.clone();
+            updated.files = merged_files;
+            updated.graph = Some(merged_graph);
+            snap.envelope = updated;
+        }
+        snap.phase2_state = SnapshotPhase2State::Settled(status);
+    }
+
+    pub fn merge_expansion(
+        &mut self,
+        parent_query_id: u64,
+        parent_node_id: Option<&str>,
+        exp_res: &ExpandResult,
+        exp_graph: &SliceGraph,
+        exp_roots: &[String],
+    ) {
+        let Some(snap) = self.entries.get_mut(&parent_query_id) else {
+            return;
+        };
+        snap.expand_seq = snap.expand_seq.saturating_add(1);
+        let k = snap.expand_seq;
+
+        let mut uri_to_fid: HashMap<String, u32> = snap
+            .envelope
+            .files
+            .iter()
+            .map(|f| (f.uri.clone(), f.file_id))
+            .collect();
+        let mut exp_fid_map: HashMap<u32, u32> = HashMap::new();
+        for f in &exp_res.files {
+            if let Some(&existing) = uri_to_fid.get(&f.uri) {
+                exp_fid_map.insert(f.file_id, existing);
+            } else {
+                let fid = snap.envelope.files.len() as u32;
+                snap.envelope.files.push(FileEntry {
+                    file_id: fid,
+                    uri: f.uri.clone(),
+                });
+                uri_to_fid.insert(f.uri.clone(), fid);
+                exp_fid_map.insert(f.file_id, fid);
+            }
+        }
+
+        let graph = snap.envelope.graph.get_or_insert_with(|| SliceGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        });
+
+        let mut parent_is_downstream = false;
+        if let Some(pid) = parent_node_id {
+            for node in &mut graph.nodes {
+                if node.id == pid
+                    && matches!(node.kind, NodeKind::FrontierNode | NodeKind::ClusterNode)
+                {
+                    node.kind = NodeKind::SourceNode;
+                }
+            }
+            parent_is_downstream = graph.edges.iter().any(|e| {
+                (e.from == pid || e.to == pid) && e.edge_side == Some(EdgeSide::Downstream)
+            });
+        }
+
+        let prefix = format!("exp{k}_");
+        for n in &exp_graph.nodes {
+            let mapped_fid = exp_fid_map.get(&n.file_id).copied().unwrap_or(n.file_id);
+            graph.nodes.push(FlowNode {
+                id: format!("{prefix}{}", n.id),
+                kind: n.kind,
+                file_id: mapped_fid,
+                range: n.range,
+                label: n.label.clone(),
+                snippet: n.snippet.clone(),
+                absence: n.absence.clone(),
+                provenance: n.provenance.clone(),
+                is_guard: n.is_guard,
+                guard_text: n.guard_text.clone(),
+                is_danger_sink: n.is_danger_sink,
+                danger_kind: n.danger_kind.clone(),
+            });
+        }
+
+        for e in &exp_graph.edges {
+            graph.edges.push(FlowEdge {
+                from: format!("{prefix}{}", e.from),
+                to: format!("{prefix}{}", e.to),
+                label: e.label.clone(),
+                is_back_edge: e.is_back_edge,
+                cycle_group_id: e.cycle_group_id,
+                provenance: e.provenance.clone(),
+                edge_side: e.edge_side,
+            });
+        }
+
+        if let Some(pid) = parent_node_id {
+            let side = match snap.envelope.direction {
+                SliceDirection::To => EdgeSide::Upstream,
+                SliceDirection::From => EdgeSide::Downstream,
+                SliceDirection::Both => {
+                    if parent_is_downstream {
+                        EdgeSide::Downstream
+                    } else {
+                        EdgeSide::Upstream
+                    }
+                }
+            };
+            for r in exp_roots {
+                graph.edges.push(FlowEdge {
+                    from: pid.to_string(),
+                    to: format!("{prefix}{r}"),
+                    label: Some("expanded".to_string()),
+                    is_back_edge: false,
+                    cycle_group_id: None,
+                    provenance: "expand_node".to_string(),
+                    edge_side: Some(side),
+                });
+            }
+        }
+
+        for reason in &exp_res.truncation {
+            if !snap.envelope.truncation.contains(reason) {
+                snap.envelope.truncation.push(*reason);
+            }
+        }
+    }
+}
+
+pub struct ExportPhase2Job {
+    pub id: RpcId,
+    pub params: ExportParams,
+    pub ctx: Phase2Context,
+    pub fallback_envelope: SliceEnvelope,
+    pub fallback_graph: SliceGraph,
+    pub cancel: Arc<AtomicBool>,
+    pub query_id: u64,
+    pub trace_id: String,
+    pub state: Arc<TransportState>,
+    pub _guard: QueryCancelGuard,
+}
+
+pub struct SliceDeltaJob {
     pub ctx: Phase2Context,
     pub cancel: Arc<AtomicBool>,
     pub query_id: u64,
@@ -40,15 +283,22 @@ pub struct Phase2Job {
     pub _guard: QueryCancelGuard,
 }
 
+pub enum Phase2Job {
+    SliceDelta(Box<SliceDeltaJob>),
+    Export(Box<ExportPhase2Job>),
+}
+
 pub struct TransportState {
     pub engine: Arc<SlicerEngine>,
     pub log_path: Option<String>,
     pub out_tx: Sender<String>,
     pub next_engine_id: AtomicU64,
     pub next_trace_id: AtomicU64,
+    pub next_export_qid: AtomicU64,
     pub pending_reverse: Mutex<HashMap<RpcId, (u64, oneshot::Sender<RpcResponse>)>>,
     pub active_cancels: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     pub phase2_tx: Mutex<Option<Sender<Phase2Job>>>,
+    pub snapshot_cache: Mutex<QuerySnapshotCache>,
     pub shutdown_flag: AtomicBool,
 }
 
@@ -73,9 +323,11 @@ impl TransportState {
             out_tx,
             next_engine_id: AtomicU64::new(1),
             next_trace_id: AtomicU64::new(1),
+            next_export_qid: AtomicU64::new(100_000),
             pending_reverse: Mutex::new(HashMap::new()),
             active_cancels: Mutex::new(HashMap::new()),
             phase2_tx: Mutex::new(phase2_tx),
+            snapshot_cache: Mutex::new(QuerySnapshotCache::default()),
             shutdown_flag: AtomicBool::new(false),
         })
     }
@@ -215,20 +467,120 @@ pub fn serve_stdio(engine: Arc<SlicerEngine>, log_path: Option<String>) {
         let rx = phase2_rx.clone();
         phase2_workers.push(thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                if !job.cancel.load(Ordering::Relaxed)
-                    && !job.state.shutdown_flag.load(Ordering::Relaxed)
-                {
-                    if let Some(delta_env) = job.state.engine.execute_phase2(job.ctx, &job.cancel) {
-                        if !job.cancel.load(Ordering::Relaxed) {
-                            let notif = RpcNotification::new(
-                                "lineage/sliceDelta",
-                                serde_json::json!({
-                                    "query_id": job.query_id,
-                                    "trace_id": job.trace_id,
-                                    "envelope": delta_env,
-                                }),
+                match job {
+                    Phase2Job::SliceDelta(delta_job) => {
+                        let SliceDeltaJob {
+                            ctx,
+                            cancel,
+                            query_id,
+                            trace_id,
+                            state,
+                            _guard,
+                        } = *delta_job;
+                        if !cancel.load(Ordering::Relaxed)
+                            && !state.shutdown_flag.load(Ordering::Relaxed)
+                        {
+                            if let Some((delta_env, full_graph, status)) =
+                                state.engine.execute_phase2_with_status(ctx, &cancel)
+                            {
+                                {
+                                    let mut cache =
+                                        state.snapshot_cache.lock().expect("snapshot_cache lock");
+                                    cache.update_phase2(query_id, &delta_env, full_graph, status);
+                                }
+                                if !cancel.load(Ordering::Relaxed) {
+                                    let notif = RpcNotification::new(
+                                        "lineage/sliceDelta",
+                                        serde_json::json!({
+                                            "query_id": query_id,
+                                            "trace_id": trace_id,
+                                            "envelope": delta_env,
+                                        }),
+                                    );
+                                    state.send_json(&notif);
+                                }
+                            }
+                        }
+                    }
+                    Phase2Job::Export(exp_job) => {
+                        let ExportPhase2Job {
+                            id,
+                            params,
+                            ctx,
+                            mut fallback_envelope,
+                            fallback_graph,
+                            cancel,
+                            query_id,
+                            trace_id,
+                            state,
+                            _guard,
+                        } = *exp_job;
+                        if cancel.load(Ordering::Relaxed)
+                            || state.shutdown_flag.load(Ordering::Relaxed)
+                        {
+                            state.send_json(&RpcResponse::err(id, RpcError::cancelled()));
+                            continue;
+                        }
+                        let wait_start = Instant::now();
+                        let timeout_ms = params
+                            .lsp_timeout_ms
+                            .unwrap_or(DEFAULT_EXPORT_LSP_TIMEOUT_MS);
+                        if let Some((mut delta_env, full_graph, status)) =
+                            state.engine.execute_phase2_with_status(ctx, &cancel)
+                        {
+                            let wait_ms = wait_start.elapsed().as_millis() as u64;
+                            {
+                                let mut cache =
+                                    state.snapshot_cache.lock().expect("snapshot_cache lock");
+                                cache.update_phase2(
+                                    query_id,
+                                    &delta_env,
+                                    full_graph.clone(),
+                                    status,
+                                );
+                            }
+                            delta_env.graph = Some(full_graph);
+                            let opts = ExportOptions::for_format(
+                                params.format,
+                                params.workspace_root.as_deref().map(PathBuf::from),
+                                params.null_only,
+                                params.include_snippets,
+                                false, // RPC never exposes absolute paths
+                                params.lsp_attached,
+                                timeout_ms,
+                                status,
+                                ExportSourceMode::FreshSlice,
+                                wait_ms,
+                                None,
                             );
-                            job.state.send_json(&notif);
+                            let out = render_export(&delta_env, &opts, &trace_id);
+                            state.send_json(&RpcResponse::ok(
+                                id,
+                                serde_json::to_value(&out.result).unwrap(),
+                            ));
+                        } else if cancel.load(Ordering::Relaxed) {
+                            state.send_json(&RpcResponse::err(id, RpcError::cancelled()));
+                        } else {
+                            let wait_ms = wait_start.elapsed().as_millis() as u64;
+                            fallback_envelope.graph = Some(fallback_graph);
+                            let opts = ExportOptions::for_format(
+                                params.format,
+                                params.workspace_root.as_deref().map(PathBuf::from),
+                                params.null_only,
+                                params.include_snippets,
+                                false,
+                                params.lsp_attached,
+                                timeout_ms,
+                                Phase2Status::TimedOut,
+                                ExportSourceMode::FreshSlice,
+                                wait_ms,
+                                None,
+                            );
+                            let out = render_export(&fallback_envelope, &opts, &trace_id);
+                            state.send_json(&RpcResponse::ok(
+                                id,
+                                serde_json::to_value(&out.result).unwrap(),
+                            ));
                         }
                     }
                 }
@@ -379,11 +731,36 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
             Ok(p) => {
                 let qid = p.query_id.unwrap_or(1);
                 let cancel = state.register_cancel(qid);
-                match state.engine.slice_phase1(&p, &trace_id, &cancel) {
-                    Ok((env, phase2_opt)) => {
+                match state
+                    .engine
+                    .slice_phase1_with_snapshot(&p, &trace_id, &cancel)
+                {
+                    Ok((env, snapshot_graph, phase2_opt)) => {
+                        let mut snap_env = env.clone();
+                        snap_env.graph = Some(snapshot_graph);
+                        let p2_state = if phase2_opt.is_some() {
+                            SnapshotPhase2State::InFlight
+                        } else {
+                            SnapshotPhase2State::Settled(Phase2Status::NotNeeded)
+                        };
+                        {
+                            let mut cache =
+                                state.snapshot_cache.lock().expect("snapshot_cache lock");
+                            cache.insert(
+                                qid,
+                                MaterializedSliceSnapshot {
+                                    envelope: snap_env,
+                                    workspace_root: p.workspace_root.clone(),
+                                    lsp_attached: p.lsp_attached,
+                                    phase2_state: p2_state,
+                                    expand_seq: 0,
+                                },
+                            );
+                        }
+
                         state.send_json(&RpcResponse::ok(id, serde_json::to_value(&env).unwrap()));
                         if let Some(ctx) = phase2_opt {
-                            let job = Phase2Job {
+                            let job = Phase2Job::SliceDelta(Box::new(SliceDeltaJob {
                                 ctx,
                                 cancel,
                                 query_id: qid,
@@ -393,10 +770,17 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
                                     query_id: qid,
                                     state: Arc::clone(state),
                                 },
-                            };
+                            }));
                             let guard = state.phase2_tx.lock().expect("phase2_tx lock");
                             if let Some(ref tx) = *guard {
-                                let _ = tx.try_send(job);
+                                if tx.try_send(job).is_err() {
+                                    tracing::warn!(
+                                        reason = "phase2_queue_full",
+                                        query_id = qid,
+                                        trace_id = %trace_id,
+                                        "phase2 queue full for lineage/slice"
+                                    );
+                                }
                             }
                         } else {
                             state.finish_query(qid);
@@ -408,6 +792,13 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
                         Err(err)
                     }
                 }
+            }
+            Err(e) => Err(RpcError::invalid_params(e.to_string())),
+        },
+        "lineage/export" => match serde_json::from_value::<ExportParams>(req.params) {
+            Ok(p) => {
+                handle_export_request(state, id.clone(), p, &trace_id);
+                return;
             }
             Err(e) => Err(RpcError::invalid_params(e.to_string())),
         },
@@ -451,8 +842,21 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
                 let cancel = Arc::new(AtomicBool::new(false));
                 state
                     .engine
-                    .expand_node(&p, &trace_id, &cancel)
-                    .map(|res| serde_json::to_value(res).unwrap())
+                    .expand_node_with_graph(&p, &trace_id, &cancel)
+                    .map(|(res, exp_graph, exp_roots)| {
+                        if let Some(parent_qid) = p.parent_query_id {
+                            let mut cache =
+                                state.snapshot_cache.lock().expect("snapshot_cache lock");
+                            cache.merge_expansion(
+                                parent_qid,
+                                p.parent_node_id.as_deref(),
+                                &res,
+                                &exp_graph,
+                                &exp_roots,
+                            );
+                        }
+                        serde_json::to_value(res).unwrap()
+                    })
             }
             Err(e) => Err(RpcError::invalid_params(e.to_string())),
         },
@@ -462,6 +866,222 @@ pub fn handle_request(state: &Arc<TransportState>, req: RpcRequest) {
     match result {
         Ok(val) => state.send_json(&RpcResponse::ok(id, val)),
         Err(err) => state.send_json(&RpcResponse::err(id, err)),
+    }
+}
+
+fn handle_export_request(
+    state: &Arc<TransportState>,
+    id: RpcId,
+    params: ExportParams,
+    trace_id: &str,
+) {
+    let timeout_ms = params
+        .lsp_timeout_ms
+        .unwrap_or(DEFAULT_EXPORT_LSP_TIMEOUT_MS);
+
+    if let Some(qid) = params.query_id {
+        let cached = {
+            let mut cache = state.snapshot_cache.lock().expect("snapshot_cache lock");
+            cache.get_cloned(qid)
+        };
+        if let Some(snap) = cached {
+            let ws_root = params
+                .workspace_root
+                .as_deref()
+                .or(snap.workspace_root.as_deref())
+                .map(PathBuf::from);
+            let (p2_status, static_reason) = match snap.phase2_state {
+                SnapshotPhase2State::Settled(status) => {
+                    if params.no_lsp && status == Phase2Status::NotNeeded {
+                        (Phase2Status::Skipped, None)
+                    } else {
+                        (status, None)
+                    }
+                }
+                SnapshotPhase2State::InFlight => {
+                    if params.no_lsp {
+                        (Phase2Status::Skipped, None)
+                    } else {
+                        (
+                            Phase2Status::TimedOut,
+                            Some("Static only (LSP still settling)".to_string()),
+                        )
+                    }
+                }
+            };
+            let opts = ExportOptions::for_format(
+                params.format,
+                ws_root,
+                params.null_only,
+                params.include_snippets,
+                false, // RPC never allows absolute_paths
+                snap.lsp_attached,
+                timeout_ms,
+                p2_status,
+                ExportSourceMode::LiveSnapshot,
+                0,
+                static_reason,
+            );
+            let out = render_export(&snap.envelope, &opts, trace_id);
+            state.send_json(&RpcResponse::ok(
+                id,
+                serde_json::to_value(&out.result).unwrap(),
+            ));
+            return;
+        }
+    }
+
+    let Some(uri) = params.uri.clone() else {
+        state.send_json(&RpcResponse::err(
+            id,
+            RpcError::invalid_params("lineage/export requires cached query_id or (uri, position)"),
+        ));
+        return;
+    };
+    let Some(position) = params.position else {
+        state.send_json(&RpcResponse::err(
+            id,
+            RpcError::invalid_params("lineage/export requires position when query_id is absent"),
+        ));
+        return;
+    };
+
+    let qid = params
+        .query_id
+        .unwrap_or_else(|| state.next_export_qid.fetch_add(1, Ordering::Relaxed));
+    let cancel = state.register_cancel(qid);
+    let slice_params = SliceParams {
+        uri,
+        position,
+        offset_encoding: params.offset_encoding,
+        direction: params.direction,
+        include_graph: false,
+        include_focus: false,
+        include_tree: false,
+        include_snippets: params.include_snippets.unwrap_or(false),
+        exclude_tests: params.exclude_tests,
+        query_id: Some(qid),
+        lsp_attached: params.lsp_attached && !params.no_lsp,
+        lsp_client_name: params.lsp_client_name.clone(),
+        workspace_root: params.workspace_root.clone(),
+        lsp_timeout_ms: Some(timeout_ms),
+    };
+
+    match state
+        .engine
+        .slice_phase1_with_snapshot(&slice_params, trace_id, &cancel)
+    {
+        Ok((mut env, snapshot_graph, phase2_opt)) => {
+            let mut snap_env = env.clone();
+            snap_env.graph = Some(snapshot_graph.clone());
+            let p2_state = if phase2_opt.is_some() && !params.no_lsp {
+                SnapshotPhase2State::InFlight
+            } else {
+                SnapshotPhase2State::Settled(if params.no_lsp {
+                    Phase2Status::Skipped
+                } else {
+                    Phase2Status::NotNeeded
+                })
+            };
+            {
+                let mut cache = state.snapshot_cache.lock().expect("snapshot_cache lock");
+                cache.insert(
+                    qid,
+                    MaterializedSliceSnapshot {
+                        envelope: snap_env,
+                        workspace_root: params.workspace_root.clone(),
+                        lsp_attached: slice_params.lsp_attached,
+                        phase2_state: p2_state,
+                        expand_seq: 0,
+                    },
+                );
+            }
+
+            let Some(mut ctx) = phase2_opt.filter(|_| !params.no_lsp) else {
+                state.finish_query(qid);
+                env.graph = Some(snapshot_graph);
+                let p2_status = if params.no_lsp {
+                    Phase2Status::Skipped
+                } else {
+                    Phase2Status::NotNeeded
+                };
+                let opts = ExportOptions::for_format(
+                    params.format,
+                    params.workspace_root.as_deref().map(PathBuf::from),
+                    params.null_only,
+                    params.include_snippets,
+                    false,
+                    slice_params.lsp_attached,
+                    timeout_ms,
+                    p2_status,
+                    ExportSourceMode::FreshSlice,
+                    0,
+                    None,
+                );
+                let out = render_export(&env, &opts, trace_id);
+                state.send_json(&RpcResponse::ok(
+                    id,
+                    serde_json::to_value(&out.result).unwrap(),
+                ));
+                return;
+            };
+
+            ctx.phase2_ceiling_ms = timeout_ms;
+            let job = Phase2Job::Export(Box::new(ExportPhase2Job {
+                id: id.clone(),
+                params: params.clone(),
+                ctx,
+                fallback_envelope: env.clone(),
+                fallback_graph: snapshot_graph.clone(),
+                cancel,
+                query_id: qid,
+                trace_id: trace_id.to_string(),
+                state: Arc::clone(state),
+                _guard: QueryCancelGuard {
+                    query_id: qid,
+                    state: Arc::clone(state),
+                },
+            }));
+            let send_res = {
+                let guard = state.phase2_tx.lock().expect("phase2_tx lock");
+                match *guard {
+                    Some(ref tx) => tx.try_send(job).map_err(|_| ()),
+                    None => Err(()),
+                }
+            };
+            if send_res.is_err() {
+                tracing::warn!(
+                    reason = "phase2_queue_full",
+                    query_id = qid,
+                    trace_id = %trace_id,
+                    "phase2 queue full for lineage/export; falling back to Phase 1"
+                );
+                state.finish_query(qid);
+                env.graph = Some(snapshot_graph);
+                let opts = ExportOptions::for_format(
+                    params.format,
+                    params.workspace_root.as_deref().map(PathBuf::from),
+                    params.null_only,
+                    params.include_snippets,
+                    false,
+                    slice_params.lsp_attached,
+                    timeout_ms,
+                    Phase2Status::Skipped,
+                    ExportSourceMode::FreshSlice,
+                    0,
+                    Some("Static only (LSP queue full)".to_string()),
+                );
+                let out = render_export(&env, &opts, trace_id);
+                state.send_json(&RpcResponse::ok(
+                    id,
+                    serde_json::to_value(&out.result).unwrap(),
+                ));
+            }
+        }
+        Err(err) => {
+            state.finish_query(qid);
+            state.send_json(&RpcResponse::err(id, err));
+        }
     }
 }
 
@@ -479,6 +1099,7 @@ fn build_init_result(state: &TransportState) -> InitializeResult {
                 .collect(),
             reverse_rpc: true,
             delta_notifications: true,
+            export_formats: vec!["mermaid".to_string(), "dot".to_string(), "html".to_string()],
         },
     }
 }

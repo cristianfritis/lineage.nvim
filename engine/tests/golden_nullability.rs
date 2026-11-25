@@ -1,6 +1,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use lineage_engine::adapters::go::GoAdapter;
 use lineage_engine::adapters::python::PythonAdapter;
 use lineage_engine::adapters::rust::RustAdapter;
 use lineage_engine::adapters::typescript::TypeScriptAdapter;
@@ -34,6 +35,7 @@ fn make_engine() -> SlicerEngine {
         Arc::new(TypeScriptAdapter::new()),
         Arc::new(PythonAdapter::new()),
         Arc::new(RustAdapter::new()),
+        Arc::new(GoAdapter::new()),
     ];
     SlicerEngine::new(cache, dirty, resolver, adapters)
 }
@@ -346,6 +348,73 @@ fn all_probes() -> Vec<Probe> {
             name: "rs_11_unresolved_call_unverified",
             ext: "rs",
             src: "fn f() { let <|>x = unknown_helper(); }",
+            expected: ExpectedKind::Unverified,
+        },
+        // --- Go (11 probes) ---
+        Probe {
+            name: "go_01_nil_literal",
+            ext: "go",
+            src: "package main\nfunc f() *int { <|>p := nil; return p }",
+            expected: ExpectedKind::NullableOrAbsent,
+        },
+        Probe {
+            name: "go_02_zero_ptr",
+            ext: "go",
+            src: "package main\nfunc f() *int { var <|>p *int; return p }",
+            expected: ExpectedKind::NullableOrAbsent,
+        },
+        Probe {
+            name: "go_03_zero_slice",
+            ext: "go",
+            src: "package main\nfunc f() []int { var <|>s []int; return s }",
+            expected: ExpectedKind::NullableOrAbsent,
+        },
+        Probe {
+            name: "go_04_os_open_stdlib",
+            ext: "go",
+            src: "package main\nimport \"os\"\nfunc f() *os.File { <|>fp, _ := os.Open(\"a\"); return fp }",
+            expected: ExpectedKind::NullableOrAbsent,
+        },
+        Probe {
+            name: "go_05_param_flow_1hop",
+            ext: "go",
+            src: "package main\nfunc id(p *int) *int { return p }\nfunc f(c bool) *int { var a *int; if c { x := 1; a = &x }; <|>out := id(a); return out }",
+            expected: ExpectedKind::NullableOrAbsent,
+        },
+        Probe {
+            name: "go_06_const_nonnull",
+            ext: "go",
+            src: "package main\nfunc f() int { <|>x := 42; return x }",
+            expected: ExpectedKind::NonNull,
+        },
+        Probe {
+            name: "go_07_val_err_implies_guard",
+            ext: "go",
+            src: "package main\nfunc fetch() (*int, error) { x := 1; return &x, nil }\nfunc f() *int { val, err := fetch(); if err != nil { return nil }; return <|>val }",
+            expected: ExpectedKind::NonNull,
+        },
+        Probe {
+            name: "go_08_comma_ok_guard",
+            ext: "go",
+            src: "package main\nfunc f(m map[string]string) string { v, ok := m[\"k\"]; if ok { return <|>v }; return \"\" }",
+            expected: ExpectedKind::NonNull,
+        },
+        Probe {
+            name: "go_09_defer_named_return_unverified",
+            ext: "go",
+            src: "package main\nfunc f() (res *int) { x := 1; res = &x; defer func() { res = nil }(); return <|>res }",
+            expected: ExpectedKind::Unverified,
+        },
+        Probe {
+            name: "go_10_chan_recv_unverified",
+            ext: "go",
+            src: "package main\nfunc f(ch chan int) int { <|>x := <-ch; return x }",
+            expected: ExpectedKind::Unverified,
+        },
+        Probe {
+            name: "go_11_unresolved_call_unverified",
+            ext: "go",
+            src: "package main\nfunc f() int { <|>x := unknownHelper(); return x }",
             expected: ExpectedKind::Unverified,
         },
     ]

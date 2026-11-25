@@ -13,6 +13,8 @@ local active = {
   bufnr = nil,
   winid = nil,
   origin_win = nil,
+  origin_buf = nil,
+  origin_uri = nil,
   origin_pos = nil,
   anchor = "NW",
   show_unverified = false,
@@ -23,6 +25,29 @@ local active = {
 
 function M.get_active_state()
   return active
+end
+
+function M.get_export_context()
+  if
+    not active.bufnr
+    or not vim.api.nvim_buf_is_valid(active.bufnr)
+    or not active.winid
+    or not vim.api.nvim_win_is_valid(active.winid)
+    or vim.api.nvim_get_current_buf() ~= active.bufnr
+  then
+    return nil
+  end
+  local cfg = config.get()
+  return {
+    active_buf = active.bufnr,
+    query_id = (active.query_id and active.query_id > 0) and active.query_id or nil,
+    origin_buf = active.origin_buf,
+    origin_uri = active.origin_uri,
+    origin_pos = active.origin_pos,
+    direction = "to",
+    exclude_tests = cfg.exclude_tests or false,
+    null_only = false,
+  }
 end
 
 local function close_hover(restore_cursor)
@@ -259,6 +284,14 @@ local function bind_hover_keymaps(bufnr, hover_id)
     require("lineage.ui.tree").open("both", { origin_win = origin_win, origin_pos = origin_pos })
   end, map_opts)
 
+  local export_key = km.export or "ge"
+  vim.keymap.set("n", export_key, function()
+    if hover_id ~= active.hover_id then
+      return
+    end
+    require("lineage.export").pick_and_export()
+  end, map_opts)
+
   local closes = km.close or { "q", "<Esc>" }
   if type(closes) == "string" then
     closes = { closes }
@@ -385,6 +418,8 @@ function M.open()
   active.hover_id = active.hover_id + 1
   active.query_id = client.next_query_id()
   active.origin_win = origin_win
+  active.origin_buf = origin_buf
+  active.origin_uri = uri
   active.origin_pos = origin_pos
 
   local hover_id = active.hover_id

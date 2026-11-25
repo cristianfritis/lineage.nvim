@@ -16,7 +16,8 @@ CONTENTS                                                    *lineage-contents*
 
 `lineage.nvim` connects Neovim (`>= 0.10`) to the `lineage-engine` Rust
 sidecar to perform demand-driven, flow-sensitive nullability and dataflow
-slicing across TypeScript/TSX/JavaScript, Python, and Rust.
+slicing across TypeScript/TSX/JavaScript, Python, Rust, and Go (including
+`vtsls`/`ts_ls`, `pyright`/`ty`, `rust-analyzer`, and `gopls`).
 
 ==============================================================================
 2. INSTALLATION                                              *lineage-install*
@@ -59,6 +60,11 @@ prebuilt binary is installed). SHA-256 mismatches always abort with an error.
     from          Open Interactive Tree Panel (Data Flow From Here)
     both          Open Interactive Tree Panel (bidirectional)
     back          Pop the Lineage jump stack
+    export        Export graph (mermaid|dot|html) [path] [--direction to|from|both]
+                  [--null-only] [--exclude-tests] [--no-lsp] [--snippets]
+                  [--no-snippets] [--open] [--no-open] [--out path]
+                  (use :Lineage export! to overwrite; `:Lineage export clean`
+                  clears cached HTML exports)
     install       Download/verify prebuilt binary or build with Cargo
     install!      Force re-install of pinned lineage-engine binary
     status        Open scratch buffer with sidecar status metrics
@@ -87,7 +93,19 @@ Call `require("lineage").setup(opts)` with any overrides to these defaults: >lua
       },
     },
     lsp = { timeout_ms = 150 },
-    tree = { height = 14 },
+    tree = {
+      height = 14,
+      keymaps = { export = "e" },
+    },
+    export = {
+      default_format = "mermaid",
+      lsp_timeout_ms = 500,
+      picker = true,
+      html = {
+        open = true,
+        cache_max_files = 20,
+      },
+    },
     exclude_tests = false,
   })
 <
@@ -101,6 +119,10 @@ Plug Mappings:
   <Plug>(LineageTo)         Open Tree Panel (to)
   <Plug>(LineageFrom)       Open Tree Panel (from)
   <Plug>(LineageBack)       Jump back in Lineage stack
+  <Plug>(LineageExport)     Export active slice graph (picker or default)
+  <Plug>(LineageExportMermaid) Export active slice graph as Mermaid
+  <Plug>(LineageExportDot)  Export active slice graph as Graphviz DOT
+  <Plug>(LineageExportHtml) Export active slice graph as offline HTML
 
 Two-Phase Hover Keymaps:
   <CR>                      Jump to origin on cursor line
@@ -109,11 +131,13 @@ Two-Phase Hover Keymaps:
   gs                        Switch to Inline Focus Mode
   gp                        Pin Inline Focus Mode
   gt / gf / gn              Open Tree Panel (to / from / both)
+  ge                        Export slice graph
   q / <Esc>                 Close hover and restore cursor
 
 Interactive Tree Panel Keymaps:
   <CR>                      Expand frontier [+] or jump to location
   o                         Expand frontier or toggle fold
+  e                         Export active Tree slice graph
   g                         Toggle grouping (Root Origin / Nullability)
   n                         Toggle Null-only filter
   t                         Toggle Exclude-tests filter
@@ -142,11 +166,13 @@ Standalone CLI diagnostics (outside Neovim):
   lineage-engine dump-ir <file>
   lineage-engine dump-cfg --dot <file>
   lineage-engine slice <file>:<line>:<col> --format json --trace
+  lineage-engine export <file>:<line>:<col> --format mermaid --direction both
+  lineage-engine export <file>:<line>:<col> --format html --out flow.html
 
 ==============================================================================
 7. v1 SCOPE BOUNDARIES                                         *lineage-scope*
 
-- Languages: TypeScript/TSX/JavaScript, Python, and Rust in v1.
+- Languages: TypeScript/TSX/JavaScript, Python, Rust, and Go.
 - Prebuilt targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
   `aarch64-apple-darwin`, `x86_64-apple-darwin`. Other targets use Cargo.
 - No Mason registry integration and no background auto-updates in v1.

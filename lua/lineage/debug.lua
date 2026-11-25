@@ -16,6 +16,35 @@ local function open_scratch(title, lines)
   vim.bo[buf].modifiable = false
 end
 
+function M.format_telemetry_entry(entry)
+  if entry.method == "lineage/export" then
+    local base = string.format(
+      "    - last method=lineage/export format=%s mode=%s phase2=%s rtt=%sms bytes=%s",
+      tostring(entry.format),
+      tostring(entry.source_mode or "n/a"),
+      tostring(entry.phase2_status or "n/a"),
+      tostring(entry.rtt_ms),
+      tostring(entry.output_bytes or 0)
+    )
+    if entry.open_status ~= nil then
+      base = base .. " open=" .. tostring(entry.open_status)
+    end
+    if entry.cache_pruned ~= nil then
+      base = base .. " pruned=" .. tostring(entry.cache_pruned)
+    end
+    return base
+  end
+  return string.format(
+    "    - last qid=%s trace=%s phase1=%sms phase2=%sms rtt=%sms delta=%s",
+    tostring(entry.query_id),
+    tostring(entry.trace_id),
+    tostring(entry.phase1_ms),
+    tostring(entry.phase2_ms),
+    tostring(entry.rtt_ms),
+    tostring(entry.delta_received)
+  )
+end
+
 local function format_rss(rss_bytes)
   if type(rss_bytes) ~= "number" then
     return "n/a"
@@ -65,18 +94,7 @@ function M.show_status()
     table.insert(pretty, "  telemetry_ring:   " .. tostring(#telemetry) .. " queries")
     if #telemetry > 0 then
       local last = telemetry[#telemetry]
-      table.insert(
-        pretty,
-        string.format(
-          "    - last qid=%s trace=%s phase1=%sms phase2=%sms rtt=%sms delta=%s",
-          tostring(last.query_id),
-          tostring(last.trace_id),
-          tostring(last.phase1_ms),
-          tostring(last.phase2_ms),
-          tostring(last.rtt_ms),
-          tostring(last.delta_received)
-        )
-      )
+      table.insert(pretty, M.format_telemetry_entry(last))
     end
     open_scratch("lineage://status", pretty)
   end)

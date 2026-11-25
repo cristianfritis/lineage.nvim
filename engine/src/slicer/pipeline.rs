@@ -3,8 +3,10 @@ use std::collections::{BinaryHeap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::protocol::schema::{
-    AbsenceSummary, CanonicalRange, FlowEdge, FlowNode, NodeKind, SliceGraph, TruncationReason,
+    AbsenceSummary, CanonicalRange, EdgeSide, FlowEdge, FlowNode, NodeKind, SliceGraph,
+    TruncationReason,
 };
+use crate::slicer::scc::tarjan_scc;
 
 pub const MAX_DEPTH: u32 = 5;
 pub const MAX_NODES: usize = 150;
@@ -21,6 +23,10 @@ pub struct RawSliceNode {
     pub snippet: Option<String>,
     pub absence: AbsenceSummary,
     pub provenance: String,
+    pub is_guard: bool,
+    pub guard_text: Option<String>,
+    pub is_danger_sink: bool,
+    pub danger_kind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +37,7 @@ pub struct RawSliceEdge {
     pub is_back_edge: bool,
     pub cycle_group_id: Option<u32>,
     pub provenance: String,
+    pub edge_side: Option<EdgeSide>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -158,7 +165,12 @@ pub fn run_reduction_pipeline(
             .get(raw.id.as_str())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        if raw.is_copy_passthrough && outgoing.len() == 1 && entry.depth > 0 {
+        if raw.is_copy_passthrough
+            && !raw.is_guard
+            && !raw.is_danger_sink
+            && outgoing.len() == 1
+            && entry.depth > 0
+        {
             contracted_chains += 1;
             let edge = outgoing[0];
             emitted_nodes.push(to_flow_node(raw, NodeKind::ContractedChain));
@@ -169,6 +181,7 @@ pub fn run_reduction_pipeline(
                 is_back_edge: edge.is_back_edge,
                 cycle_group_id: edge.cycle_group_id,
                 provenance: edge.provenance.clone(),
+                edge_side: edge.edge_side,
             });
             if let Some(next_node) = node_map.get(edge.to.as_str()) {
                 if !visited.contains(next_node.id.as_str()) {
@@ -204,6 +217,7 @@ pub fn run_reduction_pipeline(
                 is_back_edge: edge.is_back_edge,
                 cycle_group_id: edge.cycle_group_id,
                 provenance: edge.provenance.clone(),
+                edge_side: edge.edge_side,
             });
             if !edge.is_back_edge && !visited.contains(edge.to.as_str()) {
                 if let Some(next_node) = node_map.get(edge.to.as_str()) {
@@ -219,6 +233,8 @@ pub fn run_reduction_pipeline(
         }
     }
 
+    annotate_cycles(root_ids, &emitted_nodes, &mut emitted_edges);
+
     PipelineOutput {
         graph: SliceGraph {
             nodes: emitted_nodes,
@@ -227,6 +243,91 @@ pub fn run_reduction_pipeline(
         truncation,
         nodes_visited,
         contracted_chains,
+    }
+}
+
+fn annotate_cycles(root_ids: &[String], nodes: &[FlowNode], edges: &mut [FlowEdge]) {
+    let n = nodes.len();
+    if n == 0 || edges.is_empty() {
+        return;
+    }
+    let node_idx: std::collections::HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| (node.id.as_str(), i))
+        .collect();
+
+    let mut scc_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut dfs_adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    for (eidx, edge) in edges.iter().enumerate() {
+        if let (Some(&u), Some(&v)) = (
+            node_idx.get(edge.from.as_str()),
+            node_idx.get(edge.to.as_str()),
+        ) {
+            scc_adj[u].push(v);
+            dfs_adj[u].push((v, eidx));
+        }
+    }
+
+    let scc_res = tarjan_scc(&scc_adj);
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+
+    fn dfs_back_edges(
+        u: usize,
+        adj: &[Vec<(usize, usize)>],
+        color: &mut [Color],
+        back_flags: &mut [bool],
+    ) {
+        color[u] = Color::Gray;
+        for &(v, eidx) in &adj[u] {
+            match color[v] {
+                Color::Gray => {
+                    back_flags[eidx] = true;
+                }
+                Color::White => {
+                    dfs_back_edges(v, adj, color, back_flags);
+                }
+                Color::Black => {}
+            }
+        }
+        color[u] = Color::Black;
+    }
+
+    let mut color = vec![Color::White; n];
+    let mut back_flags = vec![false; edges.len()];
+    for root in root_ids {
+        if let Some(&ridx) = node_idx.get(root.as_str()) {
+            if color[ridx] == Color::White {
+                dfs_back_edges(ridx, &dfs_adj, &mut color, &mut back_flags);
+            }
+        }
+    }
+    for u in 0..n {
+        if color[u] == Color::White {
+            dfs_back_edges(u, &dfs_adj, &mut color, &mut back_flags);
+        }
+    }
+
+    for (eidx, edge) in edges.iter_mut().enumerate() {
+        if let (Some(&u), Some(&v)) = (
+            node_idx.get(edge.from.as_str()),
+            node_idx.get(edge.to.as_str()),
+        ) {
+            let scc_u = scc_res.node_to_scc[u];
+            let scc_v = scc_res.node_to_scc[v];
+            if scc_u == scc_v && (scc_res.sccs[scc_u].len() > 1 || u == v) {
+                edge.cycle_group_id = Some(scc_u as u32);
+            } else {
+                edge.cycle_group_id = None;
+            }
+            edge.is_back_edge = edge.is_back_edge || back_flags[eidx];
+        }
     }
 }
 
@@ -240,6 +341,10 @@ fn to_flow_node(raw: &RawSliceNode, kind: NodeKind) -> FlowNode {
         snippet: raw.snippet.clone(),
         absence: raw.absence.clone(),
         provenance: raw.provenance.clone(),
+        is_guard: raw.is_guard,
+        guard_text: raw.guard_text.clone(),
+        is_danger_sink: raw.is_danger_sink,
+        danger_kind: raw.danger_kind.clone(),
     }
 }
 

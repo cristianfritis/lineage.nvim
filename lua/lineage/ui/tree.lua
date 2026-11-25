@@ -36,6 +36,28 @@ function M.get_state()
   return state
 end
 
+function M.get_export_context()
+  if
+    not state.bufnr
+    or not vim.api.nvim_buf_is_valid(state.bufnr)
+    or not state.winid
+    or not vim.api.nvim_win_is_valid(state.winid)
+    or vim.api.nvim_get_current_buf() ~= state.bufnr
+  then
+    return nil
+  end
+  return {
+    active_buf = state.bufnr,
+    query_id = (state.query_id and state.query_id > 0) and state.query_id or nil,
+    origin_buf = state.origin_buf,
+    origin_uri = state.origin_uri,
+    origin_pos = state.origin_pos,
+    direction = state.direction,
+    exclude_tests = state.exclude_tests,
+    null_only = state.null_only,
+  }
+end
+
 local function close_preview()
   if state.preview_win and vim.api.nvim_win_is_valid(state.preview_win) then
     pcall(vim.api.nvim_win_close, state.preview_win, true)
@@ -208,7 +230,7 @@ function M.render()
   local null_label = state.null_only and "ON" or "OFF"
   local tests_label = state.exclude_tests and "EXCLUDED" or "INCLUDED"
   local header = string.format(
-    "Lineage Tree (%s)%s | Group[g]: %s | Null-only[n]: %s | Tests[t]: %s | [<CR>:jump/expand o:fold m:dir q:close]",
+    "Lineage Tree (%s)%s | Group[g]: %s | Null-only[n]: %s | Tests[t]: %s | [<CR>:jump/expand o:fold e:export m:dir q:close]",
     string.upper(state.direction),
     partial_tag,
     group_label,
@@ -316,6 +338,8 @@ function M.expand_row(row)
       exclude_tests = state.exclude_tests,
       lsp_attached = #clients > 0,
       workspace_root = vim.fn.getcwd(),
+      parent_query_id = (state.query_id and state.query_id > 0) and state.query_id or nil,
+      parent_node_id = row.node_id,
     }, function(req_err, res)
       if req_err or not res then
         return
@@ -386,6 +410,12 @@ local function bind_keymaps(bufnr)
       state.direction = "to"
     end
     M.refresh()
+  end, map_opts)
+
+  local cfg = config.get()
+  local export_key = (cfg.tree and cfg.tree.keymaps and cfg.tree.keymaps.export) or "e"
+  vim.keymap.set("n", export_key, function()
+    require("lineage.export").pick_and_export()
   end, map_opts)
 
   for _, key in ipairs({ "q", "<Esc>" }) do

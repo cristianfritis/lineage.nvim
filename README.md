@@ -2,7 +2,7 @@
 
 Demand-driven, flow-sensitive interprocedural nullability and dataflow slicing for Neovim (`>= 0.10`).
 
-`lineage.nvim` pairs a local Rust sidecar (`lineage-engine`) with your attached LSP clients to answer **"where can this value become null/absent, and where does it flow?"** using Pruned SSI IR, Two-Phase Hover, Inline Focus Mode, and an Interactive Tree Panel.
+`lineage.nvim` pairs a local Rust sidecar (`lineage-engine`) with your attached LSP clients (`vtsls`/`ts_ls`, `pyright`/`ty`, `rust-analyzer`, `gopls`) to answer **"where can this value become null/absent, and where does it flow?"** across TypeScript/TSX/JavaScript, Python, Rust, and Go using Pruned SSI IR, Two-Phase Hover, Inline Focus Mode, and an Interactive Tree Panel.
 
 ## Requirements
 
@@ -40,7 +40,19 @@ Demand-driven, flow-sensitive interprocedural nullability and dataflow slicing f
         },
       },
       lsp = { timeout_ms = 150 },
-      tree = { height = 14 },
+      tree = {
+        height = 14,
+        keymaps = { export = "e" },
+      },
+      export = {
+        default_format = "mermaid",
+        lsp_timeout_ms = 500,
+        picker = true,
+        html = {
+          open = true,
+          cache_max_files = 20,
+        },
+      },
       exclude_tests = false,
     })
 
@@ -50,6 +62,7 @@ Demand-driven, flow-sensitive interprocedural nullability and dataflow slicing f
     vim.keymap.set("n", "<leader>lt", "<Plug>(LineageTo)", { desc = "Lineage Tree (To)" })
     vim.keymap.set("n", "<leader>lF", "<Plug>(LineageFrom)", { desc = "Lineage Tree (From)" })
     vim.keymap.set("n", "<leader>lb", "<Plug>(LineageBack)", { desc = "Lineage Back" })
+    vim.keymap.set("n", "<leader>le", "<Plug>(LineageExport)", { desc = "Lineage Export" })
   end,
 }
 ```
@@ -79,6 +92,8 @@ cd engine && cargo build --release
 | `:Lineage from` | Open Interactive Tree Panel: Data Flow From Here |
 | `:Lineage both` | Open Interactive Tree Panel: bidirectional flow |
 | `:Lineage back` | Jump back in the Lineage jump stack |
+| `:Lineage export <fmt> [path] [flags]` | Export graph (`mermaid` / `dot` / `html`) to clipboard, private browser cache, or file (`!` to overwrite; `--open`/`--no-open`) |
+| `:Lineage export clean` | Remove cached HTML exports from `stdpath('cache')/lineage/exports/` |
 | `:Lineage install` | Download and verify `lineage-engine` (or build with Cargo) |
 | `:Lineage install!` | Force re-install of pinned `lineage-engine` binary |
 | `:Lineage status` | Display sidecar version, cache, grammars, and log path |
@@ -93,6 +108,10 @@ cd engine && cargo build --release
 - `<Plug>(LineageTo)`
 - `<Plug>(LineageFrom)`
 - `<Plug>(LineageBack)`
+- `<Plug>(LineageExport)`
+- `<Plug>(LineageExportMermaid)`
+- `<Plug>(LineageExportDot)`
+- `<Plug>(LineageExportHtml)`
 
 ## UI Keymaps
 
@@ -106,6 +125,7 @@ cd engine && cargo build --release
 | `gs` | Switch to Inline Focus Mode |
 | `gp` | Pin Inline Focus Mode |
 | `gt` / `gf` / `gn` | Open Tree Panel (`to` / `from` / `both`) |
+| `ge` | Export slice graph (format picker or default format) |
 | `q` / `<Esc>` | Close hover and restore cursor |
 
 ### Inline Focus Mode
@@ -120,6 +140,7 @@ cd engine && cargo build --release
 |---|---|
 | `<CR>` | Expand frontier node (`[+]`) or jump to location |
 | `o` | Expand frontier or toggle fold |
+| `e` | Export active Tree slice graph (format picker or default format) |
 | `g` | Toggle grouping (`Root Origin` / `Nullability`) |
 | `n` | Toggle **Null-only** filter |
 | `t` | Toggle **Exclude tests** filter |
@@ -142,16 +163,19 @@ cd engine && cargo build --release
 
 1. Run `:checkhealth lineage` to inspect Neovim version, `lineage-engine` binary path/source, sidecar ping latency, attached LSP `offset_encoding`, loaded grammars, cache bytes, EWMA/circuit-breaker state, and rotating log path.
 2. Run `:Lineage status` or `:Lineage log` inside Neovim.
-3. Reproduce slices outside Neovim with the standalone CLI:
+3. Reproduce slices or export diagrams outside Neovim with the standalone CLI:
    ```bash
    lineage-engine dump-ir path/to/file.ts
    lineage-engine dump-cfg --dot path/to/file.ts
    lineage-engine slice path/to/file.ts:42:10 --format json --trace
+   lineage-engine export path/to/file.ts:42:10 --format mermaid --direction both --no-lsp
+   lineage-engine export path/to/file.ts:42:10 --format dot --out flow.dot
+   lineage-engine export path/to/file.ts:42:10 --format html --direction both --out flow.html
    ```
 
 ## v1 Scope Boundaries
 
-- **Supported languages:** TypeScript / TSX / JavaScript, Python, and Rust. (Go `(val, err)` semantics are validated in engine IR tests; a Go Tree-sitter adapter is not included in v1.)
+- **Supported languages:** TypeScript / TSX / JavaScript, Python, Rust, and Go.
 - **Prebuilt binaries:** Linux `musl` (`x86_64`, `aarch64`) and macOS (`arm64`, `x86_64`). Windows and other targets use the automatic `cargo build --release` fallback.
 - **No Mason registry entry in v1** and **no background auto-updates** or startup network traffic.
 - **Bounded analysis:** Buffers above 1 MB skip live sync; cross-file traversal operates within bounded caller/depth budgets and surfaces unresolved edges as `Unverified` / `[partial]`.

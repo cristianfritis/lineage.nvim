@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod cache;
 pub mod cli;
+pub mod export;
 pub mod ir;
 pub mod protocol;
 pub mod resolver;

@@ -9,6 +9,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
+use lineage_engine::adapters::go::GoAdapter;
 use lineage_engine::adapters::python::PythonAdapter;
 use lineage_engine::adapters::rust::RustAdapter;
 use lineage_engine::adapters::typescript::TypeScriptAdapter;
@@ -356,6 +357,7 @@ fn main() {
             "rust",
             Arc::new(RustAdapter::new()) as Arc<dyn LanguageAdapter>,
         ),
+        ("go", Arc::new(GoAdapter::new()) as Arc<dyn LanguageAdapter>),
     ]);
 
     let mut all_probes = Vec::new();
