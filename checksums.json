@@ -5,19 +5,19 @@
   "targets": {
     "x86_64-unknown-linux-musl": {
       "asset": "lineage-engine-x86_64-unknown-linux-musl",
-      "sha256": "TBD"
+      "sha256": "e8a8fe1f9f0d582909a3ed0cf62fd71f3cdc790c57aa0ebc3242a8cc03af25d8"
     },
     "aarch64-unknown-linux-musl": {
       "asset": "lineage-engine-aarch64-unknown-linux-musl",
-      "sha256": "TBD"
+      "sha256": "b062436676ef20b4f08495603f0a7d051fe8afb0cff549df9603d44d97a22ac7"
     },
     "aarch64-apple-darwin": {
       "asset": "lineage-engine-aarch64-apple-darwin",
-      "sha256": "TBD"
+      "sha256": "0d343fe3eddd66388a274f4cc17ce3d4725455432e4a6fa3c99a3cd61d81abe8"
     },
     "x86_64-apple-darwin": {
       "asset": "lineage-engine-x86_64-apple-darwin",
-      "sha256": "TBD"
+      "sha256": "cc5f99fc97018ccad51f75950c56f42ac27c827b0f7ba7e4c30b1fc6a9608077"
     }
   }
 }
