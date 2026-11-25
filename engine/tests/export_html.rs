@@ -146,11 +146,9 @@ fn segment_intersects_box_interior(
 fn verify_geometry(layout: &SvgLayout) {
     assert!(layout.view_width > 0 && layout.view_height > 0);
     // 1. Zero node-node AABB overlaps
-    for i in 0..layout.nodes.len() {
-        let a = &layout.nodes[i];
+    for (i, a) in layout.nodes.iter().enumerate() {
         assert!(a.x >= 0 && a.y >= 0);
-        for j in (i + 1)..layout.nodes.len() {
-            let b = &layout.nodes[j];
+        for b in layout.nodes.iter().skip(i + 1) {
             let x_overlap = a.x < b.x + b.w && a.x + a.w > b.x;
             let y_overlap = a.y < b.y + b.h && a.y + a.h > b.y;
             assert!(
